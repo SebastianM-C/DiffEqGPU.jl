@@ -25,10 +25,13 @@ developer interfaces above, but should preserve the documented return and mutati
 storage a kernel can hold. Packages owning a type that is not isbits add a method for it
 so their type survives the trip to the device; see
 [Parameters that are not plain numbers](@ref modelingtoolkit_gpu_initialization).
+`StaticAdaptor` applies the same conversion through Adapt.jl, for wrapper types that
+already define `Adapt.adapt_structure` but have no `make_static_storage` method.
 
 ```@docs
 DiffEqGPU.make_prob_compatible
 DiffEqGPU.make_static_storage
+DiffEqGPU.StaticAdaptor
 ```
 
 ## Kernel ODE and SDE Algorithms

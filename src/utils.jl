@@ -125,6 +125,18 @@ make_static_storage(x::Tuple) = map(make_static_storage, x)
 make_static_storage(x::NamedTuple) = map(make_static_storage, x)
 make_static_storage(x) = x
 
+"""
+    DiffEqGPU.StaticAdaptor()
+
+Adapt.jl adaptor that turns the arrays inside a structure into the storage
+[`make_static_storage`](@ref) gives them. The structure itself is rebuilt by its own
+`Adapt.adapt_structure` rules, so wrapper types defined elsewhere (a `BlockedArray`, for
+example) can be made kernel-compatible without DiffEqGPU depending on their package.
+"""
+struct StaticAdaptor end
+
+Adapt.adapt_storage(::StaticAdaptor, x::AbstractArray) = make_static_storage(x)
+
 function make_nonlinear_function_compatible(oldf)
     return SciMLBase.NonlinearFunction{
         false, SciMLBase.FullSpecialize,

@@ -1,6 +1,7 @@
 module ModelingToolkitBaseExt
 
 using ModelingToolkitBase: MTKParameters, System, unknowns
+using Adapt: adapt
 import DiffEqGPU
 import SciMLBase
 
@@ -12,7 +13,10 @@ function DiffEqGPU.make_parameter_compatible(p::MTKParameters)
     compatible = MTKParameters(
         DiffEqGPU.make_static_storage(p.tunable),
         DiffEqGPU.make_static_storage(p.initials),
-        DiffEqGPU.make_static_storage(p.discrete),
+        # Callback-updated discretes live in a `BlockedArray` (one block per clock
+        # partition). `make_static_storage` does not know that type, so let its own Adapt
+        # rule rebuild it around static data.
+        adapt(DiffEqGPU.StaticAdaptor(), p.discrete),
         DiffEqGPU.make_static_storage(p.constant),
         DiffEqGPU.make_static_storage(p.nonnumeric),
         DiffEqGPU.make_static_storage(p.caches)

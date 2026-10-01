@@ -252,7 +252,8 @@ export terminate!
 # are used by packages that drive the ensemble solvers directly.
 @public EnsembleArrayAlgorithm, EnsembleKernelAlgorithm, GPUODEAlgorithm, GPUSDEAlgorithm,
     GPUODEImplicitAlgorithm, AbstractNLSolver, AbstractNLSolverCache, NLSolver,
-    make_prob_compatible, make_static_storage, maxthreads, maybe_prefer_blocks, lufact!,
+    make_prob_compatible, make_static_storage, StaticAdaptor, maxthreads,
+    maybe_prefer_blocks, lufact!,
     vectorized_solve, vectorized_asolve, vectorized_map_solve
 
 @setup_workload begin

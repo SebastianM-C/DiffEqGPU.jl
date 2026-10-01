@@ -139,6 +139,31 @@ end
     @test isbitstype(typeof(compatible_p))
 end
 
+@testset "Callback-updated discretes after a host symbolic setter" begin
+    # A discrete updated by an event is stored in a `BlockedArray`. `setsym_oop` rebuilds
+    # it around an `MVector`, and `remake(...; lazy_initialization = true)` keeps that.
+    @variables x(t) = 1.0
+    @parameters k = 2.0
+    @discretes g(t) = 1.0
+    event = ModelingToolkit.SymbolicContinuousCallback(
+        [x ~ 0.5], [g ~ Pre(g) + 1]; discrete_parameters = [g]
+    )
+    @mtkcompile sys = System([D(x) ~ -k * g * x], t, [x, g], [k]; continuous_events = [event])
+    prob = ODEProblem{false, SciMLBase.FullSpecialize}(
+        sys, [], (0.0, 2.0);
+        u0_constructor = static_constructor, p_constructor = static_constructor
+    )
+    setter = ModelingToolkit.SymbolicIndexingInterface.setsym_oop(sys, [k])
+    u0, p = setter(prob, SA[1.5])
+    for newp in (p, remake(prob; u0, p, lazy_initialization = true).p)
+        compatible_p = DiffEqGPU.make_parameter_compatible(newp)
+        @test isbitstype(typeof(compatible_p))
+        @test parent(only(compatible_p.discrete)) isa SVector
+        @test only(compatible_p.discrete) == only(newp.discrete)
+        @test compatible_p.tunable == newp.tunable
+    end
+end
+
 # ============================================================================
 # Test 3: Non-square and bounded nonlinear least-squares initialization
 # ============================================================================
