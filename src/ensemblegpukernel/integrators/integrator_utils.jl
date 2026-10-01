@@ -294,6 +294,15 @@ end
     return true, saved_in_cb
 end
 
+# Apply the `n`th continuous callback. The callbacks are a heterogeneous tuple and the index
+# of the one that fired is only known at run time, so walk the tuple: every step is a static
+# call, which keeps the kernel free of dynamic dispatch.
+@inline function apply_nth_callback!(n, integrator, args, callback, rest...)
+    return n == 1 ? apply_callback!(integrator, callback, args...) :
+        apply_nth_callback!(n - 1, integrator, args, rest...)
+end
+@inline apply_nth_callback!(n, integrator, args) = (false, false)
+
 @inline function handle_callbacks!(
         integrator::SciMLBase.AbstractODEIntegrator{
             AlgType,
@@ -324,11 +333,9 @@ end
             integrator.event_last_time = idx
             integrator.vector_event_last_time = event_idx
             continuous_modified,
-                saved_in_cb = apply_callback!(
-                integrator,
-                continuous_callbacks[1],
-                time, upcrossing,
-                event_idx, ts, us
+                saved_in_cb = apply_nth_callback!(
+                idx, integrator, (time, upcrossing, event_idx, ts, us),
+                continuous_callbacks...
             )
         else
             integrator.event_last_time = 0

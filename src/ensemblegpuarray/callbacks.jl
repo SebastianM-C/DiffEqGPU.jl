@@ -55,9 +55,14 @@ end
 
 generate_callback(::Tuple{}, I, ensemblealg) = nothing
 
-function generate_callback(x)
-    # will catch any VectorContinuousCallbacks
-    error("Callback unsupported")
+# Without this method a `VectorContinuousCallback` falls through to the method below that
+# expects a problem, and fails with an unrelated `FieldError`.
+function generate_callback(::VectorContinuousCallback, I, ensemblealg)
+    throw(
+        ArgumentError(
+            "`VectorContinuousCallback` is not supported by $(nameof(typeof(ensemblealg))). Pass its conditions as separate `ContinuousCallback`s in a `CallbackSet` instead."
+        )
+    )
 end
 
 function generate_callback(prob, I, ensemblealg; kwargs...)
