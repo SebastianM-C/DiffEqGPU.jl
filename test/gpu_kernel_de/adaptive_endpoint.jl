@@ -152,3 +152,42 @@ end
         @test all(s -> isapprox(s.u[end], SVector(11.25f0, 11.25f0); rtol = 1.0f-6), sol.u)
     end
 end
+
+# The controller clamps every later step to the next stop, but the first one starts from
+# the user's `dt` — `0.1` by default. With a shorter span that first step used to be
+# accepted as a step to `tf` carrying the state at `t0 + dt`, with no error raised.
+@testset "Adaptive initial dt longer than the span, public solve ($(nameof(typeof(alg))))" for
+    alg in ADAPTIVE_ALGS
+    tf = 0.01f0
+    prob = ODEProblem{false}((u, p, t) -> u, SVector(1.0f0), (0.0f0, tf))
+    sol = solve(
+        EnsembleProblem(prob), alg, EnsembleGPUKernel(KernelAbstractions.CPU(), 0.0);
+        trajectories = 2, abstol = 1.0f-7, reltol = 1.0f-6, save_everystep = false
+    )
+    @test all(s -> s.t[end] == tf, sol.u)
+    @test all(s -> isapprox(s.u[end][1], exp(tf); rtol = 1.0f-5), sol.u)
+end
+
+# A single trajectory used to be rerouted to `EnsembleSerial`, which cannot run a GPU
+# kernel solver — and the stiff ones have no CPU counterpart to fall back to.
+@testset "Single trajectory, public solve ($(nameof(typeof(alg))))" for alg in ADAPTIVE_ALGS
+    prob = ODEProblem{false}((u, p, t) -> u, SVector(1.0f0), (0.0f0, 1.0f0))
+    sol = solve(
+        EnsembleProblem(prob), alg, EnsembleGPUKernel(KernelAbstractions.CPU(), 0.0);
+        trajectories = 1, abstol = 1.0f-7, reltol = 1.0f-6, save_everystep = false
+    )
+    @test length(sol.u) == 1
+    @test sol.u[1].t == Float32[0, 1]
+    @test isapprox(sol.u[1].u[end][1], exp(1.0f0); rtol = 1.0f-5)
+end
+
+# `saveat = ()` is the SciML default for "no save points"; it used to be taken as an empty
+# save grid, allocating zero-length outputs and failing the kernel launch.
+@testset "saveat = () means no save points ($(nameof(typeof(alg))))" for alg in ADAPTIVE_ALGS
+    prob = ODEProblem{false}((u, p, t) -> u, SVector(1.0f0), (0.0f0, 1.0f0))
+    kw = (; trajectories = 2, abstol = 1.0f-7, reltol = 1.0f-6, save_everystep = false)
+    ensemble = EnsembleGPUKernel(KernelAbstractions.CPU(), 0.0)
+    sol = solve(EnsembleProblem(prob), alg, ensemble; saveat = (), kw...)
+    ref = solve(EnsembleProblem(prob), alg, ensemble; kw...)
+    @test all(i -> sol.u[i].t == ref.u[i].t && sol.u[i].u == ref.u[i].u, 1:2)
+end

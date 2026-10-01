@@ -52,6 +52,10 @@ ts, us = DiffEqGPU.vectorized_solve(
 """
 function vectorized_solve end
 
+# `saveat = ()` is the SciML default for "no save points" (OrdinaryDiffEq treats it so);
+# here it would otherwise be taken as an empty grid and allocate zero-length outputs.
+_normalize_saveat(::Tuple{}) = nothing
+_normalize_saveat(saveat) = saveat
 
 function _kernel_transfer(backend, x::AbstractArray)
     dest = allocate(backend, eltype(x), size(x))
@@ -87,6 +91,7 @@ function vectorized_solve(
     )
     backend = get_backend(probs)
     backend = maybe_prefer_blocks(backend)
+    saveat = _normalize_saveat(saveat)
 
     prob = convert(ImmutableODEProblem, prob)
     dt = convert(eltype(prob.tspan), dt)
@@ -151,6 +156,7 @@ function vectorized_solve(
     )
     backend = get_backend(probs)
     backend = maybe_prefer_blocks(backend)
+    saveat = _normalize_saveat(saveat)
 
     dt = convert(eltype(prob.tspan), dt)
     saveat_converted = nothing
@@ -273,6 +279,7 @@ function vectorized_asolve(
         debug = false, callback = CallbackSet(nothing), tstops = nothing,
         kwargs...
     )
+    saveat = _normalize_saveat(saveat)
 
     backend = get_backend(probs)
     backend = maybe_prefer_blocks(backend)

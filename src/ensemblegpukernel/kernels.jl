@@ -102,6 +102,10 @@ end
             abstol, reltol, DiffEqBase.ODE_DEFAULT_NORM, tstops, callback,
             saveat
         )
+        # The step controller clamps `dtnew` to the next stop after every accepted step, but
+        # the first step starts from the user's `dt`. An initial `dt` past `tf` would be
+        # accepted as a step to `tf` carrying the state at `t0 + dt`.
+        integ.dtnew = min(abs(integ.dtnew), abs(_next_stop(integ, integ.tf) - integ.t))
 
         integ.cur_t = 0
         if saveat !== nothing

@@ -15,7 +15,9 @@ function SciMLBase.__solve(
         rng_func = SciMLBase.default_rng_func,
         kwargs...
     )
-    if trajectories == 1
+    # A single trajectory runs serially on the CPU, except in kernel mode, whose solvers
+    # (the stiff ones in particular) have no CPU counterpart; a one-thread launch is fine.
+    if trajectories == 1 && !(ensemblealg isa EnsembleGPUKernel)
         return SciMLBase.__solve(
             ensembleprob, alg, EnsembleSerial(); trajectories = 1,
             seed, rng, rng_func, kwargs...
@@ -272,7 +274,9 @@ function batch_solve(
         end
 
         _saveat = get(_unwrap_kernel_host(kernel_probs[1]).kwargs, :saveat, nothing)
-        saveat = _saveat === nothing ? get(kwargs, :saveat, nothing) : _saveat
+        saveat = _normalize_saveat(
+            _saveat === nothing ? get(kwargs, :saveat, nothing) : _saveat
+        )
         solts, kernel_solus = batch_solve_up_kernel(
             ensembleprob, kernel_probs, adapted_kernel_probs, alg, ensemblealg, I,
             adaptive; saveat, kwargs...
