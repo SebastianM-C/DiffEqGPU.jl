@@ -303,6 +303,37 @@ end
 end
 @inline apply_nth_callback!(n, integrator, args) = (false, false)
 
+# The earliest event among the continuous callbacks, ties to the lower index, as
+# `DiffEqBase.find_first_continuous_callback` finds it. That one is a `@generated` function
+# that is not inlined, so the integrator passed to it escapes and the kernel heap-allocates
+# it for every trajectory, which runs out of device heap on a large ensemble. This version
+# inlines completely. (The kernel takes no `VectorContinuousCallback`, which is all the
+# DiffEqBase version adds.)
+@inline function find_first_continuous_callback(integrator, callbacks...)
+    tmin, upcrossing, event_occurred, event_idx, idx, residual =
+        _find_first_continuous_callback(integrator, 1, callbacks...)
+    if event_occurred
+        integrator.last_event_error = DiffEqBase.value(residual)
+    end
+    return tmin, upcrossing, event_occurred, event_idx, idx, length(callbacks)
+end
+
+@inline function _find_first_continuous_callback(integrator, i, callback)
+    tmin, upcrossing, event_occurred, event_idx, residual =
+        DiffEqBase.find_callback_time(integrator, callback, i)
+    return tmin, upcrossing, event_occurred, event_idx, i, residual
+end
+
+@inline function _find_first_continuous_callback(integrator, i, callback, rest...)
+    first = _find_first_continuous_callback(integrator, i, callback)
+    later = _find_first_continuous_callback(integrator, i + 1, rest...)
+    # `later` wins only if strictly earlier, so a tie goes to the lower index.
+    if later[3] && (!first[3] || integrator.tdir * later[1] < integrator.tdir * first[1])
+        return later
+    end
+    return first
+end
+
 @inline function handle_callbacks!(
         integrator::SciMLBase.AbstractODEIntegrator{
             AlgType,
@@ -324,7 +355,7 @@ end
             event_occurred,
             event_idx,
             idx,
-            counter = DiffEqBase.find_first_continuous_callback(
+            counter = find_first_continuous_callback(
             integrator,
             continuous_callbacks...
         )
@@ -463,7 +494,9 @@ end
         callback_t = top_t
         residual = zero(bottom_condition)
     else
-        zero_func(abst, p = nothing) = DiffEqBase.get_condition(integrator, callback, abst)
+        # Inlined: the closure captures the integrator, which would otherwise escape through
+        # it and be heap-allocated for every trajectory.
+        @inline zero_func(abst, p = nothing) = DiffEqBase.get_condition(integrator, callback, abst)
         callback_t = gpu_find_root(zero_func, (bottom_t, top_t), callback.rootfind)
         residual = zero_func(callback_t)
     end

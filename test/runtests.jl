@@ -153,6 +153,9 @@ if GROUP == "CUDA"
         @time @safetestset "GPU Kernelized ODE Multiple ContinuousCallbacks" begin
             include("gpu_kernel_de/gpu_ode_multiple_continuous_callbacks.jl")
         end
+        @time @safetestset "GPU Kernelized ODE ContinuousCallback allocations" begin
+            include("gpu_kernel_de/gpu_ode_continuous_callback_allocations.jl")
+        end
         # device Random not implemented yet
         @time @safetestset "GPU Kernelized SDE Regression" begin
             include("gpu_kernel_de/gpu_sde_regression.jl")
