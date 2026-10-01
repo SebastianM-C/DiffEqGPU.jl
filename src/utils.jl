@@ -231,18 +231,25 @@ function make_nonlinear_problem_compatible(
     )
 end
 
+# A diagonal mass matrix stays diagonal, with static storage: densifying it into an
+# `SMatrix{N, N}` takes minutes to compile for a few hundred states, and adds `N²` entries
+# to every thread's state. Kernel code combines it with the Jacobian through
+# `add_mass_matrix`, which touches only the diagonal.
+_static_mass_matrix(mm::LinearAlgebra.Diagonal, N) =
+    LinearAlgebra.Diagonal(StaticArrays.SVector{N}(mm.diag))
+_static_mass_matrix(mm, N) = StaticArrays.SMatrix{N, N}(mm)
+
 function _compatible_mass_matrix(mm, N)
     (mm isa StaticArrays.StaticArray || mm === LinearAlgebra.I) && return mm
-    return StaticArrays.SMatrix{N, N}(mm)
+    return _static_mass_matrix(mm, N)
 end
 
 function _maybe_convert_mass_matrix(prob)
     mm = prob.f.mass_matrix
     # Already an SArray, UniformScaling, or I — nothing to do
     (mm isa Union{StaticArrays.StaticArray, LinearAlgebra.UniformScaling}) && return prob
-    # Convert to SMatrix
     N = length(prob.u0)
-    smm = StaticArrays.SMatrix{N, N}(mm)
+    smm = _static_mass_matrix(mm, N)
     oldf = prob.f
     newf = SciMLBase.ODEFunction{SciMLBase.isinplace(oldf), SciMLBase.specialization(oldf)}(
         oldf.f;

@@ -42,7 +42,7 @@
     dT = Tgrad(uprev, p, t)
 
     mass_matrix = integ.f.mass_matrix
-    W = mass_matrix - γ * J
+    W = add_mass_matrix(-γ * J, mass_matrix, true)
     W_fact = W
 
     # F = lu(W)
@@ -117,7 +117,7 @@ end
         Tgrad = build_tgrad(integ.alg, f)
         dT = Tgrad(uprev, p, t)
 
-        W = mass_matrix - γ * J
+        W = add_mass_matrix(-γ * J, mass_matrix, true)
         W_fact = W
 
         # F = lu(W)

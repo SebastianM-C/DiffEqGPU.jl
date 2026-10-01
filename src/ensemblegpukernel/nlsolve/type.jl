@@ -135,7 +135,7 @@ end
     else
         finite_diff_jac(u -> f(u, p, t), f.jac_prototype, u)
     end
-    W(u, p, t) = -f.mass_matrix + γ * dt * J(u, p, t)
+    W(u, p, t) = add_mass_matrix(γ * dt * J(u, p, t), f.mass_matrix, -1)
     return J, W
 end
 

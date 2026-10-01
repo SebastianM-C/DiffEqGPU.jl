@@ -1,3 +1,21 @@
+# `A + α * M`, the matrix the stiff solvers factorize. For a diagonal mass matrix only the
+# diagonal of `A` changes, so it is updated in one pass over `A`: the generic
+# `StaticMatrix + Diagonal` reads all `N²` entries of the `Diagonal`, which for large `N`
+# compiles far slower than the dense case (minutes at `N = 124`).
+@inline add_mass_matrix(A, M, α) = A + α * M
+@inline function add_mass_matrix(
+        A::StaticArrays.SMatrix{N, N, T}, M::LinearAlgebra.Diagonal{<:Any, <:StaticArrays.SVector{N}},
+        α
+    ) where {N, T}
+    d = M.diag
+    return StaticArrays.SMatrix{N, N, T}(
+        ntuple(Val(N * N)) do k
+            i = (k - 1) % N + 1
+            i == (k - 1) ÷ N + 1 ? A[k] + α * d[i] : A[k]
+        end
+    )
+end
+
 function alg_order(alg::Union{GPUODEAlgorithm, GPUSDEAlgorithm})
     error("Order is not defined for this algorithm")
 end

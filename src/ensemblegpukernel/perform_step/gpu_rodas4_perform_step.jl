@@ -64,7 +64,7 @@
 
     # Starting
     mass_matrix = f.mass_matrix
-    W = J - mass_matrix * inv(dtgamma)
+    W = add_mass_matrix(J, mass_matrix, -inv(dtgamma))
     du = f(uprev, p, t)
 
     # Step 1
@@ -185,7 +185,7 @@ end
 
         # Starting
         mass_matrix = f.mass_matrix
-        W = J - mass_matrix * inv(dtgamma)
+        W = add_mass_matrix(J, mass_matrix, -inv(dtgamma))
         du = f(uprev, p, t)
 
         # Step 1
