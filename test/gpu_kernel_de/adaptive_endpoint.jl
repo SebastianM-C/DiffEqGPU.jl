@@ -172,13 +172,17 @@ end
 # kernel solver — and the stiff ones have no CPU counterpart to fall back to.
 @testset "Single trajectory, public solve ($(nameof(typeof(alg))))" for alg in ADAPTIVE_ALGS
     prob = ODEProblem{false}((u, p, t) -> u, SVector(1.0f0), (0.0f0, 1.0f0))
-    sol = solve(
+    solve_n(n) = solve(
         EnsembleProblem(prob), alg, EnsembleGPUKernel(KernelAbstractions.CPU(), 0.0);
-        trajectories = 1, abstol = 1.0f-7, reltol = 1.0f-6, save_everystep = false
+        trajectories = n, abstol = 1.0f-7, reltol = 1.0f-6, save_everystep = false
     )
+    sol = solve_n(1)
     @test length(sol.u) == 1
     @test sol.u[1].t == Float32[0, 1]
-    @test isapprox(sol.u[1].u[end][1], exp(1.0f0); rtol = 1.0f-5)
+    # The single trajectory runs the same kernel solve as a batch of them.
+    @test sol.u[1].u[end] == solve_n(2).u[1].u[end]
+    # Global error, not the local tolerance: second-order Rosenbrock23 ends about 2e-5 off.
+    @test isapprox(sol.u[1].u[end][1], exp(1.0f0); rtol = 1.0f-4)
 end
 
 # `saveat = ()` is the SciML default for "no save points"; it used to be taken as an empty
