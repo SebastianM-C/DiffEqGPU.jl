@@ -10,15 +10,14 @@ diffeqgpunorm(u::ForwardDiff.Dual, t) = abs(ForwardDiff.value(u))
 # over the whole batch lets one hard trajectory be outvoted by the easy ones and miss its
 # own tolerance; the largest per-trajectory RMS makes the shared step the one the hardest
 # trajectory needs.
-struct TrajectoryNorm
+struct TrajectoryNorm{R <: Ref{Int}}
     len::Int
     # The trajectory with the largest error in the last norm of a state-shaped array: when the
     # shared step fails, the trajectory that made it fail.
-    worst::Base.RefValue{Int}
+    worst::R
 end
 TrajectoryNorm(len::Integer) = TrajectoryNorm(len, Ref(0))
 
-# OrdinaryDiffEq broadcasts the norm over residual arrays; treat it as a scalar like a function.
 # OrdinaryDiffEq broadcasts the norm over residual arrays; treat it as a scalar like a function.
 Base.broadcastable(n::TrajectoryNorm) = Ref(n)
 
