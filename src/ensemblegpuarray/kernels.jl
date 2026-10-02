@@ -281,6 +281,34 @@ end
     end
 end
 
+# Forward-mode seeding for the batched Jacobian: every trajectory's states `j0, …, j0 + C - 1`
+# get the unit partials `1, …, C`, all other states zero partials.
+@kernel function seed_jacobian_duals_kernel(ud, @Const(u), @Const(j0))
+    i = @index(Global, Linear)
+    D = eltype(ud)
+    @inbounds for k in 1:size(u, 1)
+        ud[k, i] = D(u[k, i], ForwardDiff.Partials(_unit_partials(D, k - j0 + 1)))
+    end
+end
+
+@inline function _unit_partials(::Type{ForwardDiff.Dual{Tag, V, C}}, m) where {Tag, V, C}
+    return ntuple(c -> ifelse(c == m, one(V), zero(V)), Val(C))
+end
+
+# The partials of the batched right-hand side are columns `j0, …, j0 + C - 1` of each
+# trajectory's Jacobian.
+@kernel function scatter_jacobian_partials_kernel(W, @Const(dud), @Const(j0))
+    i = @index(Global, Linear)
+    N = size(dud, 1)
+    @inbounds for k in 1:N
+        partials = ForwardDiff.partials(dud[k, i])
+        for m in 1:length(partials)
+            j = j0 + m - 1
+            j <= N && (W[k, j, i] = partials[m])
+        end
+    end
+end
+
 # `mass_diag` is the diagonal of the mass matrix shared by every trajectory, or `nothing` for
 # the identity.
 @inline _mass_diagonal(::Nothing, j, W) = one(eltype(W))

@@ -88,15 +88,74 @@ function is_singular_mass_matrix(M, N)
     return d !== nothing && any(iszero, d)
 end
 
+# Fills `W[:, :, i]` with trajectory `i`'s Jacobian from the problem's own `jac`.
+struct AnalyticBatchedJacobian{IIP, J}
+    jac::J
+end
+AnalyticBatchedJacobian{IIP}(jac::J) where {IIP, J} = AnalyticBatchedJacobian{IIP, J}(jac)
+
+function (J::AnalyticBatchedJacobian{IIP})(W, u, p, t) where {IIP}
+    version = get_backend(u)
+    wgs = workgroupsize(version, size(u, 2))
+    kernel = IIP ? batched_jac_kernel : batched_jac_kernel_oop
+    kernel(version)(J.jac, W, u, p, t; ndrange = size(u, 2), workgroupsize = wgs)
+    return nothing
+end
+
+# Tag of the dual numbers of the batched forward-mode Jacobian.
+struct DiffEqGPUJacobianTag end
+
+"""
+    ADBatchedJacobian(f, u0; chunksize)
+
+Fills `W[:, :, i]` with trajectory `i`'s Jacobian by forward-mode automatic
+differentiation of the batched right-hand side `f(du, u, p, t)`.
+
+The Jacobian of the batched problem is block diagonal, so one evaluation of `f` on dual
+numbers seeded in states `j, …, j + chunksize - 1` of every trajectory at once gives those
+columns of all the per-trajectory Jacobians: `cld(N, chunksize)` evaluations per Jacobian.
+The dual state and derivative are preallocated, `2 N ntraj (chunksize + 1)` numbers of the
+element type of `u0`. Only the state is differentiated; the parameters and `t` stay plain,
+so the right-hand side must accept dual-number states.
+"""
+struct ADBatchedJacobian{F, UD}
+    f::F
+    ud::UD
+    dud::UD
+end
+
+function ADBatchedJacobian(
+        f, u0; chunksize = ForwardDiff.pickchunksize(size(u0, 1), 8)
+    )
+    D = ForwardDiff.Dual{DiffEqGPUJacobianTag, eltype(u0), chunksize}
+    return ADBatchedJacobian(f, similar(u0, D), similar(u0, D))
+end
+
+function (J::ADBatchedJacobian)(W, u, p, t)
+    version = get_backend(u)
+    wgs = workgroupsize(version, size(u, 2))
+    N = size(u, 1)
+    for j0 in 1:ForwardDiff.npartials(eltype(J.ud)):N
+        seed_jacobian_duals_kernel(version)(
+            J.ud, u, j0; ndrange = size(u, 2), workgroupsize = wgs
+        )
+        J.f(J.dud, J.ud, p, t)
+        scatter_jacobian_partials_kernel(version)(
+            W, J.dud, j0; ndrange = size(u, 2), workgroupsize = wgs
+        )
+    end
+    return nothing
+end
+
 # `Wfact_t(W, u, p, gamma, t)` for the batched problem: per trajectory,
 # `W[:, :, i] = J_i - M / gamma`, factorized in place (pivoted when `ipiv` is given), as
-# OrdinaryDiffEq expects.
-function batched_Wfact_t(jac, isinplace, mass_diag, ipiv)
-    jac_kernel = isinplace ? batched_jac_kernel : batched_jac_kernel_oop
+# OrdinaryDiffEq expects. `fill_jacobian!(W, u, p, t)` writes the per-trajectory Jacobians
+# into `W`.
+function batched_Wfact_t(fill_jacobian!, mass_diag, ipiv)
     return function (W, u, p, gamma, t)
         version = get_backend(u)
         wgs = workgroupsize(version, size(u, 2))
-        jac_kernel(version)(jac, W, u, p, t; ndrange = size(u, 2), workgroupsize = wgs)
+        fill_jacobian!(W, u, p, t)
         subtract_mass_kernel(version)(
             W, mass_diag, gamma; ndrange = size(u, 2), workgroupsize = wgs
         )
@@ -137,6 +196,9 @@ restructure_parameters(p::StaticArrays.StaticArray, column) =
     similar_type(p)(column)
 restructure_parameters(p, column) = copyto!(similar(p), column)
 
+function batched_Wfact_t(jac, isinplace::Bool, mass_diag, ipiv)
+    return batched_Wfact_t(AnalyticBatchedJacobian{isinplace}(jac), mass_diag, ipiv)
+end
 
 function generate_problem(
         prob::SciMLBase.AbstractODEProblem,
@@ -159,8 +221,12 @@ function generate_problem(
 
     mass_matrix, mass_diag = batched_mass_matrix(prob.f.mass_matrix, u0)
 
+    # Without the problem's `jac`, a stiff solve (signalled by `jac_prototype`) differentiates
+    # the batched right-hand side instead.
     _Wfact!_t = if SciMLBase.has_jac(prob.f)
         batched_Wfact_t(prob.f.jac, DiffEqBase.isinplace(prob), mass_diag, ipiv)
+    elseif jac_prototype !== nothing
+        batched_Wfact_t(ADBatchedJacobian(_f, u0), mass_diag, ipiv)
     else
         nothing
     end
@@ -288,9 +354,24 @@ function supports_singular_mass_matrix(alg)
     return nameof(parentmodule(typeof(alg))) === :OrdinaryDiffEqRosenbrock
 end
 
-# A stiff method builds its iteration matrix from the batched `Wfact_t`, which needs the
-# per-trajectory Jacobian `f.jac`.
-has_batched_jacobian(f) = SciMLBase.has_jac(f)
+# A stiff method builds its iteration matrix from the batched `Wfact_t`, which takes the
+# per-trajectory Jacobians from `f.jac` or, without it, from automatic differentiation of the
+# right-hand side (ODE problems only).
+needs_batched_jacobian(prob, alg) = SciMLBase.has_jac(prob.f) || hasproperty(alg, :linsolve)
+needs_batched_jacobian(prob::SDEProblem, alg) = SciMLBase.has_jac(prob.f)
+
+# Storage for the `len × len × ntraj` batched iteration matrix of a stiff solve, or `nothing`.
+function batched_jac_prototype(prob, alg, ensemblealg, u0, ntraj)
+    needs_batched_jacobian(prob, alg) || return nothing
+    len = length(prob.u0)
+    if ensemblealg isa EnsembleGPUArray
+        jac_prototype = allocate(ensemblealg.backend, eltype(u0), (len, len, ntraj))
+        fill!(jac_prototype, false)
+        return jac_prototype
+    else
+        return zeros(eltype(u0), len, len, ntraj)
+    end
+end
 
 """
     check_array_algorithm(prob, alg)
@@ -313,13 +394,6 @@ function check_array_algorithm(prob::SciMLBase.AbstractODEProblem, alg)
         throw(
             ArgumentError(
                 "`EnsembleGPUArray` solves the linear systems of a stiff method with its own batched factorization, so `linsolve = $(nameof(typeof(alg.linsolve)))()` is not supported. Leave `linsolve` unset."
-            )
-        )
-    end
-    if !has_batched_jacobian(prob.f)
-        throw(
-            ArgumentError(
-                "`EnsembleGPUArray` needs the Jacobian of the right-hand side to use the stiff method `$(nameof(typeof(alg)))`: pass it as `ODEFunction(f; jac)`, or build the problem with ModelingToolkit using `jac = true`."
             )
         )
     end

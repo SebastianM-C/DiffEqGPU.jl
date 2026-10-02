@@ -99,6 +99,9 @@ if GROUP in SUPPORTS_LUFACT
     @time @safetestset "EnsembleGPUArray MTKParameters" begin
         include("ensemblegpuarray_mtkparameters.jl")
     end
+    @time @safetestset "EnsembleGPUArray AD Jacobian" begin
+        include("ensemblegpuarray_ad_jacobian.jl")
+    end
 end
 
 # EnsembleGPUArray kernels has Int64 arguments, causing them to fail with Metal and oneAPI
@@ -150,6 +153,9 @@ if GROUP == "CPU"
     end
     @time @safetestset "EnsembleGPUArray mass matrices" begin
         include("ensemblegpuarray_mass_matrix.jl")
+    end
+    @time @safetestset "EnsembleGPUArray AD Jacobian" begin
+        include("ensemblegpuarray_ad_jacobian.jl")
     end
     @time @safetestset "EnsembleGPUArray scalar batch parameters" begin
         include("ensemblegpuarray_scalar_batch.jl")

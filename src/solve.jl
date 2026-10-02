@@ -491,22 +491,14 @@ function batch_solve_up(ensembleprob, probs, alg, ensemblealg, I, u0, p; kwargs.
 
     len = length(probs[1].u0)
 
-    if SciMLBase.has_jac(probs[1].f)
-        if ensemblealg isa EnsembleGPUArray
-            backend = ensemblealg.backend
-            jac_prototype = allocate(backend, eltype(u0), (len, len, length(I)))
-            fill!(jac_prototype, false)
-        else
-            jac_prototype = zeros(eltype(u0), len, len, length(I))
-        end
-
+    jac_prototype = batched_jac_prototype(probs[1], alg, ensemblealg, u0, length(I))
+    if jac_prototype !== nothing
         if probs[1].f.colorvec !== nothing
             colorvec = repeat(probs[1].f.colorvec, length(I))
         else
             colorvec = repeat(1:length(probs[1].u0), length(I))
         end
     else
-        jac_prototype = nothing
         colorvec = nothing
     end
 
@@ -596,6 +588,15 @@ function ChainRulesCore.rrule(
     end
 
     len = length(probs[1].u0)
+
+    # The batched AD Jacobian would nest its dual numbers inside the parameter duals.
+    if !SciMLBase.has_jac(probs[1].f) && needs_batched_jacobian(probs[1], alg)
+        throw(
+            ArgumentError(
+                "Differentiating an `EnsembleGPUArray` solve with the stiff method `$(nameof(typeof(alg)))` needs the Jacobian of the right-hand side: pass it as `ODEFunction(f; jac)`."
+            )
+        )
+    end
 
     if SciMLBase.has_jac(probs[1].f)
         if ensemblealg isa EnsembleGPUArray

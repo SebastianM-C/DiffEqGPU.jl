@@ -71,22 +71,14 @@ function vectorized_map_solve_up(prob, alg, ensemblealg, I, u0, p; kwargs...)
 
     len = length(prob.u0)
 
-    if SciMLBase.has_jac(prob.f)
-        if ensemblealg isa EnsembleGPUArray
-            backend = ensemblealg.backend
-            jac_prototype = allocate(backend, Float32, (len, len, length(I)))
-            fill!(jac_prototype, 0.0)
-        else
-            jac_prototype = zeros(Float32, len, len, length(I))
-        end
-
+    jac_prototype = batched_jac_prototype(prob, alg, ensemblealg, u0, length(I))
+    if jac_prototype !== nothing
         if prob.f.colorvec !== nothing
             colorvec = repeat(prob.f.colorvec, length(I))
         else
             colorvec = repeat(1:length(prob.u0), length(I))
         end
     else
-        jac_prototype = nothing
         colorvec = nothing
     end
 

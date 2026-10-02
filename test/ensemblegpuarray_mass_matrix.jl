@@ -212,7 +212,6 @@ end
     @test_throws "diagonal mass matrices only" ensemble_solve(
         ODEFunction(dae!; jac = dae_jac!, mass_matrix = [1.0 0.5; 0.0 0.0]), Rodas5P()
     )
-    @test_throws "needs the Jacobian" ensemble_solve(ODEFunction(dae!), Rodas5P())
     @test_throws "linsolve" ensemble_solve(
         singular, Rodas5P(linsolve = DiffEqGPU.LinearSolve.LUFactorization())
     )
