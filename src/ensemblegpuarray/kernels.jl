@@ -161,11 +161,18 @@ end
     i = @index(Global, Linear)
     @inbounds event_direction = simultaneous_events[i]
     if event_direction == Int8(1)
-        @views @inbounds affect!(FakeIntegrator(u[:, i], t, ensemble_param(p, i)))
+        @views @inbounds apply_affect!(affect!, FakeIntegrator(u[:, i], t, ensemble_param(p, i)))
     elseif event_direction == Int8(-1)
-        @views @inbounds affect_neg!(FakeIntegrator(u[:, i], t, ensemble_param(p, i)))
+        @views @inbounds apply_affect!(affect_neg!, FakeIntegrator(u[:, i], t, ensemble_param(p, i)))
     end
 end
+
+# A `ContinuousCallback` direction without an affect (`affect! = nothing` or
+# `affect_neg! = nothing`) is still detected by the batched `VectorContinuousCallback`, which
+# has no per-direction affects, so it must be a no-op here. Dispatching on `Nothing` keeps the
+# branch out of the compiled kernel.
+@inline apply_affect!(affect!, integrator) = affect!(integrator)
+@inline apply_affect!(::Nothing, integrator) = nothing
 
 """
     maxthreads(backend)

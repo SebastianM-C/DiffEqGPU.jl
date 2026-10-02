@@ -82,6 +82,26 @@ This introduces the following limitations on its usage:
   - To use multiple GPUs over clusters, one must manually set up one process per GPU. See
     the multi-GPU tutorial for more details.
 
+# Callbacks
+
+Callbacks can be given on the problem or as the `callback` keyword of `solve`. As in
+`solve` for a single problem, the keyword is merged with the problem's callback unless
+`merge_callbacks = false`, in which case it replaces it.
+
+Conditions and affects run once per trajectory inside a kernel, on a stand-in integrator
+that holds the trajectory's `u`, `t` and `p`. An affect may modify `u` and, when the
+parameters are an array per trajectory, `p`; each returned solution's `prob.p` holds the
+trajectory's parameters at the end of the solve.
+
+All trajectories share one integrator, so:
+
+  - an event in any trajectory shortens the step of every trajectory;
+  - `save_positions` saves the state of every trajectory at every event;
+  - a `ContinuousCallback` direction without an affect (`affect! = nothing` or
+    `affect_neg! = nothing`) is still located, and the affect is skipped;
+  - callbacks with a custom `initialize` or `finalize`, and callbacks combined with
+    trajectories that have different time spans, throw an `ArgumentError`.
+
 !!! warn
 
     Callbacks with `terminate!` do not work well with `EnsembleGPUArray` because the entire

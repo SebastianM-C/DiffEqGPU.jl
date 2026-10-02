@@ -135,6 +135,7 @@ function generate_callback(
     else
         cur = [false for i in 1:I]
     end
+    check_callback_hooks(callback, ensemblealg)
     _condition = callback.condition
     _affect! = callback.affect!
 
@@ -159,5 +160,8 @@ function generate_callback(
             workgroupsize = wgs
         )
     end
-    return DiscreteCallback(condition, affect!, save_positions = callback.save_positions)
+    return DiscreteCallback(
+        condition, affect!; save_positions = callback.save_positions,
+        initializealg = callback.initializealg
+    )
 end

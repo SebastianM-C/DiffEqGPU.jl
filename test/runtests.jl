@@ -109,6 +109,9 @@ if GROUP in SUPPORTS_DOUBLE_PRECISION
     @time @safetestset "EnsembleGPUArray per-trajectory error norm" begin
         include("ensemblegpuarray_trajectory_norm.jl")
     end
+    @time @safetestset "EnsembleGPUArray callbacks" begin
+        include("ensemblegpuarray_callbacks.jl")
+    end
     @time @safetestset "Reduction" begin
         include("reduction.jl")
     end
@@ -144,6 +147,9 @@ if GROUP == "CPU"
     end
     @time @safetestset "EnsembleGPUArray pivoted LU" begin
         include("ensemblegpuarray_pivoting.jl")
+    end
+    @time @safetestset "EnsembleGPUArray callbacks" begin
+        include("ensemblegpuarray_callbacks.jl")
     end
     @time @safetestset "Adaptive endpoint termination" begin
         include("gpu_kernel_de/adaptive_endpoint.jl")

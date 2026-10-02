@@ -27,6 +27,26 @@ end
 batched_lufact!(backend, W, ::Nothing) = lufact!(backend, W)
 batched_lufact!(backend, W, ipiv) = lufact!(backend, W, ipiv)
 
+# Callbacks write into the batched `nparam × ntraj` parameter matrix in place. Read it back
+# once per batch so each returned solution can carry its trajectory's final parameters.
+final_batch_parameters(p::AbstractMatrix{<:Number}) = Array(p)
+final_batch_parameters(p) = nothing
+
+# Only the matrix layout of `pack_ordinary_parameters` exposes mutable per-trajectory
+# parameters to affects; scalar and non-numeric batches reach the affect as values.
+final_trajectory_problem(prob, ::Nothing, i) = prob
+function final_trajectory_problem(prob, final_p::AbstractMatrix, i)
+    p = prob.p
+    p isa AbstractVector{<:Number} && length(p) == size(final_p, 1) || return prob
+    column = @view final_p[:, i]
+    all(isequal.(p, column)) && return prob
+    return remake(prob; p = restructure_parameters(p, column))
+end
+
+restructure_parameters(p::StaticArrays.StaticArray, column) =
+    similar_type(p)(column)
+restructure_parameters(p, column) = copyto!(similar(p), column)
+
 function generate_problem(
         prob::SciMLBase.AbstractODEProblem,
         u0,

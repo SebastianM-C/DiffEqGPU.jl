@@ -1,7 +1,23 @@
+# `initialize` and `finalize` would run once on the batched integrator, whose `u` and `p`
+# hold every trajectory, rather than once per trajectory. Refuse them instead of running
+# them with the wrong meaning.
+function check_callback_hooks(callback, ensemblealg)
+    if callback.initialize !== SciMLBase.INITIALIZE_DEFAULT ||
+            callback.finalize !== SciMLBase.FINALIZE_DEFAULT
+        throw(
+            ArgumentError(
+                "$(nameof(typeof(ensemblealg))) does not support callbacks with a custom `initialize` or `finalize`: they would run once on the batched integrator instead of once per trajectory."
+            )
+        )
+    end
+    return nothing
+end
+
 function generate_callback(callback::ContinuousCallback, I, ensemblealg)
     if ensemblealg isa EnsembleGPUKernel
         return callback
     end
+    check_callback_hooks(callback, ensemblealg)
     _condition = callback.condition
     _affect! = callback.affect!
     _affect_neg! = callback.affect_neg!
@@ -35,9 +51,18 @@ function generate_callback(callback::ContinuousCallback, I, ensemblealg)
         )
     end
 
+    # `idxs` refers to the components of one trajectory, so it is not forwarded: the batched
+    # condition reads the whole state.
     return VectorContinuousCallback(
-        condition, affect!, I,
-        save_positions = callback.save_positions
+        condition, affect!, I;
+        save_positions = callback.save_positions,
+        rootfind = callback.rootfind,
+        interp_points = callback.interp_points,
+        dtrelax = callback.dtrelax,
+        abstol = callback.abstol,
+        reltol = callback.reltol,
+        repeat_nudge = callback.repeat_nudge,
+        initializealg = callback.initializealg
     )
 end
 
@@ -54,6 +79,7 @@ function generate_callback(callback::CallbackSet, I, ensemblealg)
 end
 
 generate_callback(::Tuple{}, I, ensemblealg) = nothing
+generate_callback(::Nothing, I, ensemblealg) = nothing
 
 # Without this method a `VectorContinuousCallback` falls through to the method below that
 # expects a problem, and fails with an unrelated `FieldError`.
@@ -65,12 +91,28 @@ function generate_callback(::VectorContinuousCallback, I, ensemblealg)
     )
 end
 
-function generate_callback(prob, I, ensemblealg; kwargs...)
-    prob_cb = get(prob.kwargs, :callback, ())
-    kwarg_cb = get(kwargs, :merge_callbacks, false) ? get(kwargs, :callback, ()) : ()
+# The problem's callback and the `callback` keyword, with the semantics of
+# `DiffEqBase.merge_problem_kwargs`: a `callback` keyword is merged with the problem's
+# callback when `merge_callbacks = true` (the default) and replaces it otherwise.
+function ensemble_callbacks(prob; kwargs...)
+    prob_cb = get(prob.kwargs, :callback, nothing)
+    kwarg_cb = get(kwargs, :callback, nothing)
+    if haskey(kwargs, :callback) && !get(kwargs, :merge_callbacks, true)
+        prob_cb = nothing
+    end
+    return prob_cb, kwarg_cb
+end
 
-    if (prob_cb === nothing || isempty(prob_cb)) &&
-            (kwarg_cb === nothing || isempty(kwarg_cb))
+isempty_callback(cb) = cb === nothing || isempty(cb)
+
+function has_ensemble_callbacks(prob; kwargs...)
+    prob_cb, kwarg_cb = ensemble_callbacks(prob; kwargs...)
+    return !isempty_callback(prob_cb) || !isempty_callback(kwarg_cb)
+end
+
+function generate_callback(prob, I, ensemblealg; kwargs...)
+    prob_cb, kwarg_cb = ensemble_callbacks(prob; kwargs...)
+    if isempty_callback(prob_cb) && isempty_callback(kwarg_cb)
         return nothing
     else
         return CallbackSet(

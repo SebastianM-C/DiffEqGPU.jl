@@ -329,6 +329,16 @@ function batch_solve(
                 probs
             )
 
+            # Conditions and affects would see the normalized time and a `ParamWrapper` in
+            # place of the trajectory's parameters.
+            if has_ensemble_callbacks(probs[1]; kwargs...)
+                throw(
+                    ArgumentError(
+                        "Callbacks are not supported by EnsembleGPUArray when trajectories have different time spans. Give all trajectories the same `tspan`."
+                    )
+                )
+            end
+
             # Requires prob.p to be isbits otherwise it wouldn't work with ParamWrapper
             @assert all(prob -> isbits(prob.p), probs)
 
@@ -377,10 +387,11 @@ function batch_solve(
                 ensembleprob, probs, alg, ensemblealg, I, u0, p;
                 adaptive, kwargs...
             )
+            final_p = final_batch_parameters(sol.prob.p)
             [
                 ensembleprob.output_func(
                     SciMLBase.build_solution(
-                        probs[i], alg, sol.t,
+                        final_trajectory_problem(probs[i], final_p, i), alg, sol.t,
                         solus[i],
                         stats = sol.stats,
                         retcode = sol.retcode
@@ -563,7 +574,7 @@ function ChainRulesCore.rrule(
         colorvec = nothing
     end
 
-    _callback = generate_callback(probs[1], length(I), ensemblealg)
+    _callback = generate_callback(probs[1], length(I), ensemblealg; kwargs...)
     ipiv = lu_pivots(jac_prototype)
     prob = generate_problem(probs[1], u0, pdual, jac_prototype, colorvec, ipiv)
 
