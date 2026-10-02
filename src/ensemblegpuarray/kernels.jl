@@ -532,13 +532,8 @@ function SciMLBase.solve!(
     x = cache.u
     version = get_backend(b)
     copyto!(x, b)
-    wgs = workgroupsize(version, p.nfacts)
     # Note that the matrix is already factorized, only ldiv is needed.
-    ldiv!_kernel(version)(
-        A, x, p.ipiv, p.len, p.nfacts;
-        ndrange = p.nfacts,
-        workgroupsize = wgs
-    )
+    batched_ldiv!(version, A, x, p.ipiv, p.len, p.nfacts)
     return SciMLBase.build_linear_solution(alg, x, nothing, cache)
 end
 
@@ -546,17 +541,78 @@ end
 function (p::LinSolveGPUSplitFactorize)(x, A, b, update_matrix = false; kwargs...)
     version = get_backend(b)
     copyto!(x, b)
-    wgs = workgroupsize(version, p.nfacts)
-    ldiv!_kernel(version)(
-        A, x, p.ipiv, p.len, p.nfacts;
-        ndrange = p.nfacts,
-        workgroupsize = wgs
-    )
+    batched_ldiv!(version, A, x, p.ipiv, p.len, p.nfacts)
     return nothing
 end
 
 function (p::LinSolveGPUSplitFactorize)(::Type{Val{:init}}, f, u0_prototype)
     return LinSolveGPUSplitFactorize(size(u0_prototype)..., p.ipiv)
+end
+
+# Solve `W[:, :, i] x_i = b_i` in place for every factorization `i` of the batch, where `u`
+# holds the right-hand sides one after another. On the CPU each matrix is solved by one task;
+# on a GPU by one workgroup, whose threads update consecutive rows of a column together, so
+# their reads of `W` (column-major) coalesce. One thread per matrix would read memory `len^2`
+# apart in neighbouring threads.
+function batched_ldiv!(backend, W, u, ipiv, len, nfacts)
+    nfacts == 0 && return nothing
+    wgs = workgroupsize(backend, nfacts)
+    ldiv!_kernel(backend)(W, u, ipiv, len, nfacts; ndrange = nfacts, workgroupsize = wgs)
+    return nothing
+end
+
+function batched_ldiv!(backend::KernelAbstractions.GPU, W, u, ipiv, len, nfacts)
+    nfacts == 0 && return nothing
+    cooperative_ldiv(backend) ||
+        return invoke(batched_ldiv!, Tuple{Any, Any, Any, Any, Any, Any}, backend, W, u, ipiv, len, nfacts)
+    lanes = ldiv_lanes(len)
+    cooperative_ldiv!_kernel(backend)(
+        W, u, ipiv, len; ndrange = lanes * nfacts, workgroupsize = lanes
+    )
+    return nothing
+end
+
+# Whether `backend` runs the cooperative solve, which needs workgroup barriers inside loops.
+# Backend extensions that emulate a GPU on the CPU, where they are not, opt out.
+cooperative_ldiv(backend) = true
+
+# Threads per matrix of the cooperative solve, fewer for small systems. Measured on an
+# RTX 4080 SUPER for 24 ≤ len ≤ 124, 64 is the fastest or within a few percent of it.
+ldiv_lanes(len) = min(64, max(len, 1))
+
+@kernel function cooperative_ldiv!_kernel(W, u, @Const(ipiv), @Const(len))
+    m = @index(Group, Linear)
+    lane = @index(Local, Linear)
+    lanes = @groupsize()[1]
+    offset = (m - 1) * len
+    if lane == 1
+        apply_pivots!(@view(u[(offset + 1):(offset + len)]), ipiv, m, len)
+    end
+    @synchronize
+    # Forward substitution with the unit lower triangle.
+    @inbounds for j in 1:(len - 1)
+        xj = u[offset + j]
+        k = j + lane
+        while k <= len
+            u[offset + k] -= W[k, j, m] * xj
+            k += lanes
+        end
+        @synchronize
+    end
+    # Back substitution with the upper triangle.
+    @inbounds for j in len:-1:1
+        if lane == 1
+            u[offset + j] /= W[j, j, m]
+        end
+        @synchronize
+        xj = u[offset + j]
+        k = lane
+        while k < j
+            u[offset + k] -= W[k, j, m] * xj
+            k += lanes
+        end
+        @synchronize
+    end
 end
 
 @kernel function ldiv!_kernel(W, u, @Const(ipiv), @Const(len), @Const(nfacts))

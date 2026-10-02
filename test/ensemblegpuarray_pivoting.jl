@@ -53,6 +53,48 @@ end
     end
 end
 
+# The batched solve runs one workgroup per matrix on GPUs, with the rows of a column split
+# over its threads: sizes below, at and above the workgroup width, and batches that are not
+# multiples of it.
+@testset "batched solve, len = $len, nbatch = $nbatch" for len in (2, 3, 31, 33, 124),
+        nbatch in (1, 7, 65)
+    A = zeros(T, len, len, nbatch)
+    for i in 1:nbatch
+        M = randn(T, len, len) + T(len) * I
+        len >= 2 && (M[1, 1] = 0)
+        A[:, :, i] = M
+    end
+    b = randn(T, len * nbatch)
+    W = adapt(backend, copy(A))
+    ipiv = DiffEqGPU.lu_pivots(W)
+    DiffEqGPU.lufact!(backend, W, ipiv)
+    x = adapt(backend, zeros(T, len * nbatch))
+    LinSolveGPUSplitFactorize(len, nbatch, ipiv)(x, W, adapt(backend, b))
+    x_host = Array(x)
+    tol = 100 * len * eps(T)^(3 // 4)
+    @test all(
+        isapprox(x_host[(1 + (i - 1) * len):(i * len)], A[:, :, i] \ b[(1 + (i - 1) * len):(i * len)]; rtol = tol)
+            for i in 1:nbatch
+    )
+
+    # Unpivoted factors of diagonally dominant matrices.
+    D = copy(A)
+    for i in 1:nbatch, k in 1:len
+        D[k, k, i] = 2 * len
+    end
+    if backend isa KernelAbstractions.CPU || GROUP == "CUDA"
+        W0 = adapt(backend, copy(D))
+        DiffEqGPU.lufact!(backend, W0)
+        x0 = adapt(backend, zeros(T, len * nbatch))
+        LinSolveGPUSplitFactorize(len, nbatch)(x0, W0, adapt(backend, b))
+        x0_host = Array(x0)
+        @test all(
+            isapprox(x0_host[(1 + (i - 1) * len):(i * len)], D[:, :, i] \ b[(1 + (i - 1) * len):(i * len)]; rtol = tol)
+                for i in 1:nbatch
+        )
+    end
+end
+
 @testset "LinSolveGPUSplitFactorize() needs the system size" begin
     prob = ODEProblem(
         ODEFunction((du, u, p, t) -> (du .= -u); jac = (J, u, p, t) -> (J .= -I)),
