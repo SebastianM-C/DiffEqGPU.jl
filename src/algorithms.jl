@@ -126,6 +126,12 @@ All trajectories share one integrator, so:
   - callbacks with a custom `initialize` or `finalize`, and callbacks combined with
     trajectories that have different time spans, throw an `ArgumentError`.
 
+A `PeriodicCallback` from DiffEqCallbacks.jl is supported (load DiffEqCallbacks): its stops
+are shared by all trajectories, so the number of stops does not grow with the number of
+trajectories, and its affect runs per trajectory at every stop. Its `phase`,
+`initial_affect` and `final_affect` are honored; a custom `initialize` or `finalize` throws
+an `ArgumentError`.
+
 # Initialization
 
 Each trajectory is initialized on the host, before the batch is stacked, as the CPU solve

@@ -145,6 +145,12 @@ end
         affect!(FakeIntegrator(u[:, i], t, ensemble_param(p, i)))
 end
 
+# Applies `affect!` to every trajectory, for callbacks that fire for all of them at once.
+@kernel function all_affect!_kernel(affect!, u, @Const(t), p)
+    i = @index(Global, Linear)
+    @views @inbounds affect!(FakeIntegrator(u[:, i], t, ensemble_param(p, i)))
+end
+
 @kernel function continuous_condition_kernel(
         condition, out, @Const(u), @Const(t),
         @Const(p)

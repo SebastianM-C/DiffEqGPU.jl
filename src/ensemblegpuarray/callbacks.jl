@@ -13,6 +13,28 @@ function check_callback_hooks(callback, ensemblealg)
     return nothing
 end
 
+# A discrete callback whose condition and scheduling read only the time and the tstops of
+# the integrator, such as DiffEqCallbacks' `PeriodicCallback`, can keep that machinery on the
+# batched integrator, because all trajectories share one time span: it fires for every
+# trajectory at once, and only its user affect must run per trajectory, as
+# `batched_affect` does. Extensions add methods returning the rebuilt callback; `nothing`
+# means `callback` is not of such a kind.
+batched_time_callback(callback, ensemblealg) = nothing
+
+# `affect!(integrator)` applied to every trajectory of the batched integrator.
+function batched_affect(affect!)
+    return function (integrator)
+        version = get_backend(integrator.u)
+        wgs = workgroupsize(version, size(integrator.u, 2))
+        all_affect!_kernel(version)(
+            affect!, integrator.u, integrator.t, integrator.p;
+            ndrange = size(integrator.u, 2),
+            workgroupsize = wgs
+        )
+        return nothing
+    end
+end
+
 function generate_callback(callback::ContinuousCallback, I, ensemblealg)
     if ensemblealg isa EnsembleGPUKernel
         return callback

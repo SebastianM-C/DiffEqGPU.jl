@@ -127,6 +127,10 @@ function generate_callback(
         callback::DiscreteCallback, I,
         ensemblealg
     )
+    if !(ensemblealg isa EnsembleGPUKernel)
+        timed = batched_time_callback(callback, ensemblealg)
+        timed === nothing || return timed
+    end
     if ensemblealg isa EnsembleGPUArray
         backend = ensemblealg.backend
         cur = adapt(backend, [false for i in 1:I])
