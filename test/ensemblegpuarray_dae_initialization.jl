@@ -1,10 +1,12 @@
 using DiffEqGPU, LinearAlgebra, Test
 using OrdinaryDiffEqRosenbrock: Rodas5P, Rosenbrock23
+# The CPU reference solves initialize with OrdinaryDiffEq's nonlinear solvers.
+import OrdinaryDiffEq
 import SciMLBase
 using SciMLBase: EnsembleProblem, remake, solve
 using ModelingToolkit
 using ModelingToolkit: t_nounits as t, D_nounits as D
-import SymbolicIndexingInterface as SII
+const SII = ModelingToolkit.SymbolicIndexingInterface
 
 include("utils.jl")
 
