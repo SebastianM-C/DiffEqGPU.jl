@@ -13,4 +13,9 @@ function DiffEqGPU.lufact!(::CUDABackend, W)
     return nothing
 end
 
+function DiffEqGPU.lufact!(::CUDABackend, W, ipiv)
+    CUDA.CUBLAS.getrf_strided_batched!(W, ipiv)
+    return nothing
+end
+
 end

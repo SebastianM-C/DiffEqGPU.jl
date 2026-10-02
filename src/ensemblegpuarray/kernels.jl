@@ -393,32 +393,53 @@ end
 end
 
 """
+    lufact!(backend, W, ipiv)
     lufact!(backend, W)
 
 Factorize each square matrix in a batched matrix array in place.
 
 This is a developer interface implemented by backend extensions. The factorization is
-consumed by `LinSolveGPUSplitFactorize`; each slice `W[:, :, i]` must be a square matrix,
-and the backend implementation must provide the factorization operation callable from the
-selected execution environment.
+consumed by `LinSolveGPUSplitFactorize`; each slice `W[:, :, i]` must be a square matrix.
+
+The three-argument form uses partial (row) pivoting and stores the row interchanges of
+`W[:, :, i]` in `ipiv[:, i]` in the LAPACK `getrf` convention: row `k` was interchanged
+with row `ipiv[k, i]`, in order `k = 1, 2, …`. A generic KernelAbstractions
+implementation covers every backend; backend extensions may specialize it, for example
+with a vendor batched LU.
+
+The two-argument form factorizes without pivoting. It fails on matrices that need row
+interchanges, such as the iteration matrices of DAEs with algebraic equations whose
+Jacobian has a zero on the diagonal, and is kept for callers that pair it with a
+`LinSolveGPUSplitFactorize` constructed without pivots.
 
 # Arguments
 
   - `backend`: the execution backend.
   - `W`: a three-dimensional array whose first two dimensions contain one matrix per batch
     index.
+  - `ipiv`: an `Int32` matrix of size `(size(W, 1), size(W, 3))` on the same backend as
+    `W`, overwritten with the pivot indices.
 
 # Returns
 
-`nothing`; `W` is mutated in place.
+`nothing`; `W` (and `ipiv`) are mutated in place.
 
 # Examples
 
 ```julia
-W = reshape([2.0f0, 0.0f0, 0.0f0, 3.0f0], 2, 2, 1)
-lufact!(CPU(), W)
+W = reshape([0.0f0, 2.0f0, 1.0f0, 3.0f0], 2, 2, 1)
+ipiv = zeros(Int32, 2, 1)
+lufact!(CPU(), W, ipiv)
 ```
 """
+function lufact!(backend, W, ipiv)
+    nbatch = size(W, 3)
+    nbatch == 0 && return nothing
+    wgs = workgroupsize(backend, nbatch)
+    lufact_kernel(backend)(W, ipiv; ndrange = nbatch, workgroupsize = wgs)
+    return nothing
+end
+
 function lufact!(::CPU, W)
     len = size(W, 1)
     for i in 1:size(W, 3)
@@ -427,6 +448,22 @@ function lufact!(::CPU, W)
     end
     return nothing
 end
+
+@kernel function lufact_kernel(W, ipiv)
+    i = @index(Global, Linear)
+    _W = @inbounds @view(W[:, :, i])
+    _ipiv = @inbounds @view(ipiv[:, i])
+    generic_lufact!(_W, _ipiv, size(W, 1))
+end
+
+# Pivot storage for the batched factorization of `W`: one `Int32` column per matrix,
+# allocated on the backend of `W` and initialized to "no interchange".
+function lu_pivots(W::AbstractArray{<:Any, 3})
+    ipiv = similar(W, Int32, (size(W, 1), size(W, 3)))
+    ipiv .= Int32.(axes(ipiv, 1))
+    return ipiv
+end
+lu_pivots(::Nothing) = nothing
 
 struct FakeIntegrator{uType, tType, P}
     u::uType
@@ -438,22 +475,30 @@ end
 """
     LinSolveGPUSplitFactorize()
     LinSolveGPUSplitFactorize(len, nfacts)
+    LinSolveGPUSplitFactorize(len, nfacts, ipiv)
 
 A parameter-parallel `SciMLLinearSolveAlgorithm` for applying pre-factorized
 per-trajectory linear systems on a KernelAbstractions backend.
+
+The matrix handed to the linear solve must already hold the batched LU factors computed
+by [`lufact!`](@ref). When the factorization was pivoted, `ipiv` must be the pivot array
+that `lufact!(backend, W, ipiv)` filled, so the row interchanges are applied to the
+right-hand side; `ipiv = nothing` means the factors were computed without pivoting.
 
 # Fields
 
   - `len::Int`: the size of each factored linear system.
   - `nfacts::Int`: the number of factorizations stored in the batched factorization array.
+  - `ipiv`: the `(len, nfacts)` pivot array of the factorization, or `nothing`.
 
 # Arguments
 
   - `len::Int`: the size of each factored linear system.
   - `nfacts::Int`: the number of factorizations stored in the batched factorization array.
+  - `ipiv`: the pivot array, or `nothing` (the default) for unpivoted factors.
 
-Most users do not need to construct this directly; `EnsembleGPUArray` installs it for
-compatible stiff ensemble solves.
+Most users do not need to construct this directly; `EnsembleGPUArray` installs it, with
+the pivots of its own factorization, for compatible stiff ensemble solves.
 
 # Returns
 
@@ -465,10 +510,12 @@ A `LinSolveGPUSplitFactorize` selector configured for the supplied factorization
 linsolve = LinSolveGPUSplitFactorize(3, 256)
 ```
 """
-struct LinSolveGPUSplitFactorize <: LinearSolve.SciMLLinearSolveAlgorithm
+struct LinSolveGPUSplitFactorize{P} <: LinearSolve.SciMLLinearSolveAlgorithm
     len::Int
     nfacts::Int
+    ipiv::P
 end
+LinSolveGPUSplitFactorize(len, nfacts) = LinSolveGPUSplitFactorize(len, nfacts, nothing)
 LinSolveGPUSplitFactorize() = LinSolveGPUSplitFactorize(0, 0)
 
 LinearSolve.needs_concrete_A(::LinSolveGPUSplitFactorize) = true
@@ -478,7 +525,14 @@ function LinearSolve.init_cacheval(
         maxiters::Int, abstol, reltol, verbose::Union{Bool, LinearSolve.LinearVerbosity},
         assumptions::LinearSolve.OperatorAssumptions
     )
-    return LinSolveGPUSplitFactorize(linsol.len, length(u) ÷ linsol.len)
+    if linsol.len <= 0
+        throw(
+            ArgumentError(
+                "`LinSolveGPUSplitFactorize` needs the size of each factored system: construct it as `LinSolveGPUSplitFactorize(len, nfacts)`. `EnsembleGPUArray` installs a configured one itself, so a stiff solver there can keep its default `linsolve`."
+            )
+        )
+    end
+    return LinSolveGPUSplitFactorize(linsol.len, length(u) ÷ linsol.len, linsol.ipiv)
 end
 
 function SciMLBase.solve!(
@@ -494,7 +548,7 @@ function SciMLBase.solve!(
     wgs = workgroupsize(version, p.nfacts)
     # Note that the matrix is already factorized, only ldiv is needed.
     ldiv!_kernel(version)(
-        A, x, p.len, p.nfacts;
+        A, x, p.ipiv, p.len, p.nfacts;
         ndrange = p.nfacts,
         workgroupsize = wgs
     )
@@ -507,7 +561,7 @@ function (p::LinSolveGPUSplitFactorize)(x, A, b, update_matrix = false; kwargs..
     copyto!(x, b)
     wgs = workgroupsize(version, p.nfacts)
     ldiv!_kernel(version)(
-        A, x, p.len, p.nfacts;
+        A, x, p.ipiv, p.len, p.nfacts;
         ndrange = p.nfacts,
         workgroupsize = wgs
     )
@@ -515,15 +569,29 @@ function (p::LinSolveGPUSplitFactorize)(x, A, b, update_matrix = false; kwargs..
 end
 
 function (p::LinSolveGPUSplitFactorize)(::Type{Val{:init}}, f, u0_prototype)
-    return LinSolveGPUSplitFactorize(size(u0_prototype)...)
+    return LinSolveGPUSplitFactorize(size(u0_prototype)..., p.ipiv)
 end
 
-@kernel function ldiv!_kernel(W, u, @Const(len), @Const(nfacts))
+@kernel function ldiv!_kernel(W, u, @Const(ipiv), @Const(len), @Const(nfacts))
     i = @index(Global, Linear)
     section = (1 + ((i - 1) * len)):(i * len)
     _W = @inbounds @view(W[:, :, i])
     _u = @inbounds @view u[section]
+    apply_pivots!(_u, ipiv, i, len)
     naivesolve!(_W, _u, len)
+end
+
+# Apply the row interchanges of factorization `i` to its right-hand side, in the order
+# `getrf` performed them.
+@inline apply_pivots!(u, ::Nothing, i, len) = nothing
+@inline function apply_pivots!(u, ipiv, i, len)
+    @inbounds for k in 1:len
+        p = ipiv[k, i]
+        if p != k
+            u[k], u[p] = u[p], u[k]
+        end
+    end
+    return nothing
 end
 
 function generic_lufact!(A::AbstractMatrix{T}, minmn) where {T}
@@ -548,6 +616,43 @@ function generic_lufact!(A::AbstractMatrix{T}, minmn) where {T}
     #@cuprintf "after lufact!"
     #__printjac(A, ii)
     #@cuprintf "\n\n\n"
+    return nothing
+end
+
+# LU with partial pivoting, storing the interchanges in `ipiv` as `getrf` does. Like
+# `getrf`, a zero pivot column is skipped rather than reported: the factors are then
+# singular and the solve produces non-finite values the integrator rejects.
+function generic_lufact!(A::AbstractMatrix{T}, ipiv::AbstractVector, n) where {T}
+    @inbounds for k in 1:n
+        # Find the largest entry in the remaining part of column k
+        p = k
+        amax = abs(A[k, k])
+        for i in (k + 1):n
+            a = abs(A[i, k])
+            if a > amax
+                amax = a
+                p = i
+            end
+        end
+        ipiv[k] = p
+        if p != k
+            for j in 1:n
+                A[k, j], A[p, j] = A[p, j], A[k, j]
+            end
+        end
+        Akk = A[k, k]
+        if !iszero(Akk)
+            # Scale first column
+            Akkinv = inv(Akk)
+            for i in (k + 1):n
+                A[i, k] *= Akkinv
+            end
+        end
+        # Update the rest
+        for j in (k + 1):n, i in (k + 1):n
+            A[i, j] -= A[i, k] * A[k, j]
+        end
+    end
     return nothing
 end
 

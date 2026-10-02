@@ -22,12 +22,18 @@ function pack_ordinary_parameters(probs)
     end
 end
 
+# Factorize the batched iteration matrix: pivoted when the caller supplied pivot storage
+# (which it must then hand to `LinSolveGPUSplitFactorize`), unpivoted otherwise.
+batched_lufact!(backend, W, ::Nothing) = lufact!(backend, W)
+batched_lufact!(backend, W, ipiv) = lufact!(backend, W, ipiv)
+
 function generate_problem(
         prob::SciMLBase.AbstractODEProblem,
         u0,
         p,
         jac_prototype,
-        colorvec
+        colorvec,
+        ipiv = nothing
     )
     _f = let f = prob.f.f, kernel = DiffEqBase.isinplace(prob) ? gpu_kernel : gpu_kernel_oop
         function (du, u, p, t)
@@ -52,7 +58,7 @@ function generate_problem(
                     ndrange = size(u, 2),
                     workgroupsize = wgs
                 )
-                return lufact!(version, W)
+                return batched_lufact!(version, W, ipiv)
             end
         end
         _Wfact!_t = let jac = prob.f.jac,
@@ -66,7 +72,7 @@ function generate_problem(
                     ndrange = size(u, 2),
                     workgroupsize = wgs
                 )
-                return lufact!(version, W)
+                return batched_lufact!(version, W, ipiv)
             end
         end
     else
@@ -106,7 +112,7 @@ function generate_problem(
     )
 end
 
-function generate_problem(prob::SDEProblem, u0, p, jac_prototype, colorvec)
+function generate_problem(prob::SDEProblem, u0, p, jac_prototype, colorvec, ipiv = nothing)
     if prob.noise_rate_prototype !== nothing
         error("Incompatible problem detected. EnsembleGPUArray currently requires `prob.noise_rate_prototype === nothing`, i.e. only diagonal noise is currently supported. Track https://github.com/SciML/DiffEqGPU.jl/issues/331 for more information.")
     end
@@ -147,7 +153,7 @@ function generate_problem(prob::SDEProblem, u0, p, jac_prototype, colorvec)
                     ndrange = size(u, 2),
                     workgroupsize = wgs
                 )
-                return lufact!(version, W)
+                return batched_lufact!(version, W, ipiv)
             end
         end
         _Wfact!_t = let jac = prob.f.jac,
@@ -161,7 +167,7 @@ function generate_problem(prob::SDEProblem, u0, p, jac_prototype, colorvec)
                     ndrange = size(u, 2),
                     workgroupsize = wgs
                 )
-                return lufact!(version, W)
+                return batched_lufact!(version, W, ipiv)
             end
         end
     else

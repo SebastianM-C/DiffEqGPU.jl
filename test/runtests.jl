@@ -90,6 +90,9 @@ if GROUP in SUPPORTS_LUFACT
     @time @safetestset "EnsembleGPUArray OOP" begin
         include("ensemblegpuarray_oop.jl")
     end
+    @time @safetestset "EnsembleGPUArray pivoted LU" begin
+        include("ensemblegpuarray_pivoting.jl")
+    end
 end
 
 # EnsembleGPUArray kernels has Int64 arguments, causing them to fail with Metal and oneAPI
@@ -138,6 +141,9 @@ if GROUP == "CPU"
     end
     @time @safetestset "EnsembleGPUArray per-trajectory error norm" begin
         include("ensemblegpuarray_trajectory_norm.jl")
+    end
+    @time @safetestset "EnsembleGPUArray pivoted LU" begin
+        include("ensemblegpuarray_pivoting.jl")
     end
     @time @safetestset "Adaptive endpoint termination" begin
         include("gpu_kernel_de/adaptive_endpoint.jl")

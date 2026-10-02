@@ -91,10 +91,11 @@ function vectorized_map_solve_up(prob, alg, ensemblealg, I, u0, p; kwargs...)
     end
 
     _callback = generate_callback(prob, length(I), ensemblealg; kwargs...)
-    prob = generate_problem(prob, u0, p, jac_prototype, colorvec)
+    ipiv = lu_pivots(jac_prototype)
+    prob = generate_problem(prob, u0, p, jac_prototype, colorvec, ipiv)
 
     if hasproperty(alg, :linsolve)
-        _alg = remake(alg, linsolve = LinSolveGPUSplitFactorize(len, -1))
+        _alg = remake(alg, linsolve = LinSolveGPUSplitFactorize(len, -1, ipiv))
     else
         _alg = alg
     end
