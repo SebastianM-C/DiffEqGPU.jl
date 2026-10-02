@@ -166,6 +166,27 @@ portion is not uploaded: only initialization reads it. Each returned solution ca
 discrete values its trajectory ended with in `sol.prob.p`, so callbacks that write discretes
 are visible after the solve; the timeseries of discretes is not saved.
 
+# ModelingToolkit events
+
+The events of a ModelingToolkit system run on `EnsembleGPUArray` when the problem is built
+with [`DiffEqGPU.gpu_affect_transform`](@ref):
+
+```julia
+prob = ODEProblem(sys, u0, tspan; affect_transform = DiffEqGPU.gpu_affect_transform,
+    save_discretes = false)
+```
+
+The transform keeps ModelingToolkit's callbacks and their timing, and makes each affect run
+once per trajectory inside a kernel. Supported affects are `ImperativeAffect`s that write
+unknowns and discrete parameters; periodic discrete events (a `SymbolicDiscreteCallback`
+with a period) suit the batch best, since their stops are shared by all trajectories. Each
+returned solution's `prob.ps` holds the discrete values its trajectory ended with;
+`save_discretes = false` turns off saving their timeseries, which would read the batched
+parameters. Affects given as equations, writes to other parameters, custom `initialize` or
+`finalize` affects, and, for a system with algebraic equations, events whose
+`reinitializealg` is not `NoInit()` throw an `ArgumentError`, as does solving a problem
+whose affects were built without the transform.
+
 !!! warn
 
     Callbacks with `terminate!` do not work well with `EnsembleGPUArray` because the entire

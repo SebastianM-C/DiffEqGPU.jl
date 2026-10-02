@@ -130,6 +130,9 @@ if GROUP in SUPPORTS_DOUBLE_PRECISION
     @time @safetestset "EnsembleGPUArray PeriodicCallback" begin
         include("ensemblegpuarray_periodic_callback.jl")
     end
+    @time @safetestset "EnsembleGPUArray ModelingToolkit events" begin
+        include("ensemblegpuarray_mtk_events.jl")
+    end
     @time @safetestset "Reduction" begin
         include("reduction.jl")
     end
@@ -186,6 +189,9 @@ if GROUP == "CPU"
     end
     @time @safetestset "EnsembleGPUArray PeriodicCallback" begin
         include("ensemblegpuarray_periodic_callback.jl")
+    end
+    @time @safetestset "EnsembleGPUArray ModelingToolkit events" begin
+        include("ensemblegpuarray_mtk_events.jl")
     end
     @time @safetestset "Adaptive endpoint termination" begin
         include("gpu_kernel_de/adaptive_endpoint.jl")

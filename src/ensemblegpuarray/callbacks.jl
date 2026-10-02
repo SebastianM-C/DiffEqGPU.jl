@@ -13,6 +13,56 @@ function check_callback_hooks(callback, ensemblealg)
     return nothing
 end
 
+"""
+    DiffEqGPU.gpu_affect_transform(affect, event, sys; role)
+
+The `affect_transform` that lets the events of a ModelingToolkit system run on
+`EnsembleGPUArray`. Pass it, together with `save_discretes = false`, when building the
+problem:
+
+```julia
+prob = ODEProblem(sys, u0, tspan; affect_transform = DiffEqGPU.gpu_affect_transform,
+    save_discretes = false)
+```
+
+ModelingToolkit calls it on every compiled affect of the system's events. It returns each
+affect of an `ImperativeAffect` as a [`DiffEqGPU.GPUArrayAffect`](@ref) that runs once per
+trajectory inside a kernel, and leaves the callbacks' timing, which ModelingToolkit builds,
+unchanged. The transformed problem also solves on the CPU, with the same results.
+
+It throws an `ArgumentError` for an affect that cannot run per trajectory on the device:
+an affect given as equations (an `AffectSystem`), one that writes anything but unknowns and
+discrete parameters, one with a non-isbits function or context, one that resets jump
+aggregators, a custom `initialize` or `finalize`, and, for a system with algebraic
+equations, an event whose `reinitializealg` is not `NoInit()`.
+
+Requires ModelingToolkit (its `ModelingToolkitBase`) to be loaded.
+"""
+function gpu_affect_transform(affect, event, sys; role)
+    throw(
+        ArgumentError(
+            "`DiffEqGPU.gpu_affect_transform` transforms the events of a ModelingToolkit system; load ModelingToolkit."
+        )
+    )
+end
+
+"""
+    DiffEqGPU.GPUArrayAffect(affect)
+
+An affect that [`DiffEqGPU.gpu_affect_transform`](@ref) has checked to run once per
+trajectory inside an `EnsembleGPUArray` kernel. Calling it calls `affect` with the
+integrator, or with the per-trajectory stand-in for it inside a kernel.
+"""
+struct GPUArrayAffect{F}
+    affect::F
+end
+
+(a::GPUArrayAffect)(integrator) = a.affect(integrator)
+
+# Throws if `affect` cannot run per trajectory inside an `EnsembleGPUArray` kernel, telling
+# how to make it run there; extensions add methods for the affects their packages compile.
+check_device_affect(affect, ensemblealg) = nothing
+
 # A discrete callback whose condition and scheduling read only the time and the tstops of
 # the integrator, such as DiffEqCallbacks' `PeriodicCallback`, can keep that machinery on the
 # batched integrator, because all trajectories share one time span: it fires for every
@@ -40,6 +90,8 @@ function generate_callback(callback::ContinuousCallback, I, ensemblealg)
         return callback
     end
     check_callback_hooks(callback, ensemblealg)
+    check_device_affect(callback.affect!, ensemblealg)
+    check_device_affect(callback.affect_neg!, ensemblealg)
     _condition = callback.condition
     _affect! = callback.affect!
     _affect_neg! = callback.affect_neg!

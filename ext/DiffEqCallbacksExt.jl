@@ -12,6 +12,7 @@ using SciMLBase: SciMLBase, DiscreteCallback
 function DiffEqGPU.batched_time_callback(callback::DiscreteCallback, ensemblealg)
     periodic = callback.affect!
     periodic isa PeriodicCallbackAffect || return nothing
+    DiffEqGPU.check_device_affect(periodic.affect!, ensemblealg)
     init, condition = callback.initialize, callback.condition
     if !(
             all(n -> hasfield(typeof(init), n), (:phase, :initial_affect, :initialize)) &&

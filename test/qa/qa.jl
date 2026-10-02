@@ -86,9 +86,9 @@ run_qa(
                 # Enzyme rule interface (EnzymeRules is not `public`), and the DiffEqGPU
                 # internal transfer function the Enzyme extension writes rules for.
                 :augmented_primal, :reverse, :_kernel_transfer,
-                # DiffEqGPU's batched-callback hooks that the DiffEqCallbacks extension
-                # adds methods to.
-                :batched_affect, :batched_time_callback,
+                # DiffEqGPU's batched-callback hooks that the DiffEqCallbacks and
+                # ModelingToolkitBase extensions add methods to or call.
+                :batched_affect, :batched_time_callback, :check_device_affect,
                 # DiffEqGPU's ModelingToolkit hooks and internal problem types that the
                 # ModelingToolkitBase extension implements or builds.
                 :ImmutableSCCBlock, :ImmutableSCCNonlinearProblem, :final_parameters,
@@ -98,6 +98,16 @@ run_qa(
                 # the SciMLStructures module and SymbolicIndexingInterface's
                 # `state_values` (neither re-exporter marks them `public`).
                 :SciMLStructures, :state_values,
+                # Running ModelingToolkit event affects per trajectory: DiffEqGPU's
+                # per-trajectory stand-in for the integrator, which the extension gives
+                # SymbolicIndexingInterface methods; the SymbolicIndexingInterface and
+                # JumpProcesses modules as reached through ModelingToolkitBase, and the
+                # setter types the extension classifies (SetStateIndex,
+                # SetParameterIndex); and the ModelingToolkitBase types that event
+                # transforms receive and inspect. None is marked `public` upstream.
+                :FakeIntegrator, :SymbolicIndexingInterface, :JumpProcesses,
+                :SetStateIndex, :SetParameterIndex, :AbstractCallback, :ImplicitAffect,
+                :ParameterIndex,
             ),
         ),
         # Non-public names imported explicitly from upstream packages. The

@@ -140,6 +140,7 @@ function generate_callback(
         cur = [false for i in 1:I]
     end
     check_callback_hooks(callback, ensemblealg)
+    check_device_affect(callback.affect!, ensemblealg)
     _condition = callback.condition
     _affect! = callback.affect!
 

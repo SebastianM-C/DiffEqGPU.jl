@@ -280,4 +280,84 @@ function DiffEqGPU.make_initialization_maps_compatible(
     return umap, pmap
 end
 
+
+## Events: running ModelingToolkit affects per trajectory
+
+const SII = ModelingToolkitBase.SymbolicIndexingInterface
+
+# The per-trajectory stand-in for the integrator that `EnsembleGPUArray` kernels call affects
+# with: its `u` is the trajectory's column of the batched state and its `p` the trajectory's
+# parameters (a column of a `BatchedMTKParameters`).
+SII.state_values(integrator::DiffEqGPU.FakeIntegrator) = integrator.u
+SII.parameter_values(integrator::DiffEqGPU.FakeIntegrator) = integrator.p
+SII.current_time(integrator::DiffEqGPU.FakeIntegrator) = integrator.t
+# A compiled `ImperativeAffect` ends with `reset_jumps && reset_aggregated_jumps!(integ)`;
+# `gpu_affect_transform` refuses affects that reset jumps, but the call is still compiled for
+# the stand-in, and the generic method reads fields it does not have.
+ModelingToolkitBase.JumpProcesses.reset_aggregated_jumps!(
+    ::DiffEqGPU.FakeIntegrator, uprev = nothing; kwargs...
+) = nothing
+
+const LOWERING_HINT = "Build the problem with `affect_transform = DiffEqGPU.gpu_affect_transform, save_discretes = false` so that its events run on `EnsembleGPUArray`."
+
+function DiffEqGPU.gpu_affect_transform(
+        affect, event::ModelingToolkitBase.AbstractCallback, sys; role
+    )
+    if role === :initialize || role === :finalize
+        affect === nothing || affect === SciMLBase.INITIALIZE_DEFAULT ||
+            affect === SciMLBase.FINALIZE_DEFAULT ||
+            refuse_event("an event with a custom `$role`, which would run once on the batched integrator instead of once per trajectory")
+        return affect
+    end
+    affect === ModelingToolkitBase.EMPTY_AFFECT && return affect
+    affect isa ModelingToolkitBase.FunctionalAffect ||
+        refuse_event("an affect of type `$(nameof(typeof(affect)))`; only affects given as an `ImperativeAffect` run per trajectory on the device, so write an affect given as equations as an `ImperativeAffect`")
+    parts = ModelingToolkitBase.functional_affect_parts(affect)
+    parts.reset_jumps && refuse_event("an affect that resets jump aggregators")
+    isbits(parts.user_affect) ||
+        refuse_event("an `ImperativeAffect` whose function captures non-isbits data")
+    isbits(parts.ctx) || refuse_event("an `ImperativeAffect` with a non-isbits context")
+    foreach(pairs(parts.setters)) do (name, setter)
+        check_setter(name, setter)
+    end
+    reinit = event.reinitializealg
+    if !(reinit isa SciMLBase.NoInit) && ModelingToolkitBase.has_alg_equations(sys)
+        refuse_event("an event of a system with algebraic equations whose `reinitializealg` is $(nameof(typeof(reinit)))(); reinitializing would run on the whole batch, so use `reinitializealg = SciMLBase.NoInit()`")
+    end
+    return DiffEqGPU.GPUArrayAffect(ModelingToolkitBase.without_parameter_hooks(affect))
+end
+
+function refuse_event(what)
+    throw(ArgumentError("`EnsembleGPUArray` does not support $what."))
+end
+
+# An affect may write the trajectory's unknowns, which are its column of the batched state,
+# and its discrete parameters, which are stored per trajectory. The other parameters are
+# shared by all trajectories or fixed for the solve.
+check_setter(name, ::SII.SetStateIndex) = nothing
+function check_setter(name, setter::SII.SetParameterIndex)
+    index = setter.idx
+    index isa ModelingToolkitBase.ParameterIndex &&
+        index.portion isa SciMLStructures.Discrete && return nothing
+    portion = index isa ModelingToolkitBase.ParameterIndex ? nameof(typeof(index.portion)) :
+        nameof(typeof(index))
+    return refuse_event("an affect writing `$name`, a $portion parameter; affects may write unknowns and discrete parameters only")
+end
+function check_setter(name, setter)
+    return refuse_event("an affect writing `$name` through a `$(nameof(typeof(setter)))`; affects may write unknowns and discrete parameters only")
+end
+
+# Affects compiled without `gpu_affect_transform` would call parameter hooks, or solve
+# equations, on the per-trajectory stand-in for the integrator, which supports neither.
+function DiffEqGPU.check_device_affect(
+        affect::Union{ModelingToolkitBase.FunctionalAffect, ModelingToolkitBase.ImplicitAffect},
+        ensemblealg
+    )
+    return throw(
+        ArgumentError(
+            "This ModelingToolkit affect cannot run on $(nameof(typeof(ensemblealg))) as it is. $LOWERING_HINT"
+        )
+    )
+end
+
 end
