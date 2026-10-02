@@ -147,6 +147,87 @@ function (J::ADBatchedJacobian)(W, u, p, t)
     return nothing
 end
 
+"""
+    FDBatchedJacobian(f, u0; central = false)
+
+Fills `W[:, :, i]` with trajectory `i`'s Jacobian by finite differences of the batched
+right-hand side `f(du, u, p, t)`, perturbing state `j` of every trajectory at once.
+
+It reuses the kernel of `f` as it is, so no kernel is compiled for the Jacobian, which
+matters for large right-hand sides whose dual-number kernel is too costly to compile. A
+Jacobian takes `N + 1` evaluations of `f` with forward differences and `2N` with central
+ones, which are more accurate: about `sqrt(eps)` and `eps^(2/3)` relative error.
+"""
+struct FDBatchedJacobian{F, U, H}
+    f::F
+    up::U
+    f0::U
+    f1::U
+    h::H
+    central::Bool
+end
+
+function FDBatchedJacobian(f, u0; central = false)
+    return FDBatchedJacobian(
+        f, similar(u0), similar(u0), similar(u0), similar(u0, eltype(u0), size(u0, 2)),
+        central
+    )
+end
+
+function (J::FDBatchedJacobian)(W, u, p, t)
+    version = get_backend(u)
+    wgs = workgroupsize(version, size(u, 2))
+    launch = (; ndrange = size(u, 2), workgroupsize = wgs)
+    T = real(eltype(u))
+    rel = J.central ? cbrt(eps(T)) : sqrt(eps(T))
+    copyto!(J.up, u)
+    J.central || J.f(J.f0, u, p, t)
+    for j in 1:size(u, 1)
+        fd_perturb_kernel(version)(J.up, u, J.h, j, rel, true; launch...)
+        J.f(J.f1, J.up, p, t)
+        if J.central
+            fd_perturb_kernel(version)(J.up, u, J.h, j, rel, false; launch...)
+            J.f(J.f0, J.up, p, t)
+        end
+        fd_scatter_kernel(version)(W, J.f1, J.f0, J.h, j, J.central ? 2 : 1; launch...)
+        fd_restore_kernel(version)(J.up, u, j; launch...)
+    end
+    return nothing
+end
+
+_ad_chunksize(::ADTypes.AutoForwardDiff{C}) where {C} = C
+
+"""
+    batched_jacobian(f, u0, alg)
+
+The filler of the per-trajectory Jacobians for a stiff solve of a problem without `jac`,
+as the algorithm's `autodiff` asks: `AutoForwardDiff` (whose `chunksize` sets the dual
+chunk, `ForwardDiff.pickchunksize(N, 8)` by default) or `AutoFiniteDiff` (`:forward` or
+`:central` differences). Other automatic differentiation backends throw an `ArgumentError`.
+"""
+function batched_jacobian(f, u0, alg)
+    ad = hasproperty(alg, :autodiff) ? alg.autodiff : ADTypes.AutoForwardDiff()
+    ad isa ADTypes.AutoSparse && (ad = ADTypes.dense_ad(ad))
+    if ad isa ADTypes.AutoForwardDiff
+        c = _ad_chunksize(ad)
+        return c === nothing ? ADBatchedJacobian(f, u0) :
+            ADBatchedJacobian(f, u0; chunksize = c)
+    elseif ad isa ADTypes.AutoFiniteDiff
+        fdtype = ad.fdjtype
+        fdtype isa Union{Val{:forward}, Val{:central}} || throw(
+            ArgumentError(
+                "`EnsembleGPUArray` computes the Jacobian with forward or central finite differences; got `fdjtype = $fdtype`."
+            )
+        )
+        return FDBatchedJacobian(f, u0; central = fdtype isa Val{:central})
+    end
+    throw(
+        ArgumentError(
+            "`EnsembleGPUArray` computes the Jacobian of a problem without `jac` with `AutoForwardDiff` or `AutoFiniteDiff`; the algorithm asks for `$(nameof(typeof(ad)))`. Pass `autodiff = AutoForwardDiff()` or `AutoFiniteDiff()` to the algorithm, or give the problem a `jac`."
+        )
+    )
+end
+
 # `Wfact_t(W, u, p, gamma, t)` for the batched problem: per trajectory,
 # `W[:, :, i] = J_i - M / gamma`, factorized in place (pivoted when `ipiv` is given), as
 # OrdinaryDiffEq expects. `fill_jacobian!(W, u, p, t)` writes the per-trajectory Jacobians
@@ -206,7 +287,8 @@ function generate_problem(
         p,
         jac_prototype,
         colorvec,
-        ipiv = nothing
+        ipiv = nothing;
+        alg = nothing
     )
     _f = let f = prob.f.f, kernel = DiffEqBase.isinplace(prob) ? gpu_kernel : gpu_kernel_oop
         function (du, u, p, t)
@@ -226,7 +308,7 @@ function generate_problem(
     _Wfact!_t = if SciMLBase.has_jac(prob.f)
         batched_Wfact_t(prob.f.jac, DiffEqBase.isinplace(prob), mass_diag, ipiv)
     elseif jac_prototype !== nothing
-        batched_Wfact_t(ADBatchedJacobian(_f, u0), mass_diag, ipiv)
+        batched_Wfact_t(batched_jacobian(_f, u0, alg), mass_diag, ipiv)
     else
         nothing
     end
@@ -263,7 +345,10 @@ function generate_problem(
     )
 end
 
-function generate_problem(prob::SDEProblem, u0, p, jac_prototype, colorvec, ipiv = nothing)
+# `alg` is accepted for the shared call sites: an SDE solve only uses the problem's own `jac`.
+function generate_problem(
+        prob::SDEProblem, u0, p, jac_prototype, colorvec, ipiv = nothing; alg = nothing
+    )
     if prob.noise_rate_prototype !== nothing
         error("Incompatible problem detected. EnsembleGPUArray currently requires `prob.noise_rate_prototype === nothing`, i.e. only diagonal noise is currently supported. Track https://github.com/SciML/DiffEqGPU.jl/issues/331 for more information.")
     end

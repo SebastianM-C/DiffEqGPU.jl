@@ -504,7 +504,7 @@ function batch_solve_up(ensembleprob, probs, alg, ensemblealg, I, u0, p; kwargs.
 
     _callback = generate_callback(probs[1], length(I), ensemblealg; kwargs...)
     ipiv = lu_pivots(jac_prototype)
-    prob = generate_problem(probs[1], u0, p, jac_prototype, colorvec, ipiv)
+    prob = generate_problem(probs[1], u0, p, jac_prototype, colorvec, ipiv; alg)
 
     if hasproperty(alg, :linsolve)
         _alg = remake(alg, linsolve = LinSolveGPUSplitFactorize(len, -1, ipiv))

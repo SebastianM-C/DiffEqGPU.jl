@@ -18,6 +18,7 @@ using LinearAlgebra: LinearAlgebra, Diagonal, I, LowerTriangular, NoPivot, RowMa
     SingularException, UniformScaling, UpperTriangular, det, diag, isdiag
 using Distributed: Distributed, nprocs, pmap
 using ForwardDiff: ForwardDiff
+using ADTypes: ADTypes
 import ChainRulesCore
 import ChainRulesCore: NoTangent
 using RecursiveArrayTools: RecursiveArrayTools, VectorOfArray

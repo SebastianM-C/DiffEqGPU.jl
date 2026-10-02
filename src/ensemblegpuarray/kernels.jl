@@ -315,6 +315,37 @@ end
     end
 end
 
+# Finite differences of the batched right-hand side: state `j` of every trajectory is
+# perturbed at once. The step is relative to the state, and `h` keeps the increment actually
+# represented in floating point, so the quotients divide by the true difference.
+@kernel function fd_perturb_kernel(up, @Const(u), h, @Const(j), @Const(rel), @Const(plus))
+    i = @index(Global, Linear)
+    @inbounds begin
+        uj = u[j, i]
+        if plus
+            up[j, i] = uj + rel * max(one(uj), abs(uj))
+            h[i] = up[j, i] - uj
+        else
+            up[j, i] = uj - h[i]
+        end
+    end
+end
+
+@kernel function fd_restore_kernel(up, @Const(u), @Const(j))
+    i = @index(Global, Linear)
+    @inbounds up[j, i] = u[j, i]
+end
+
+@kernel function fd_scatter_kernel(W, @Const(f1), @Const(f0), @Const(h), @Const(j), @Const(steps))
+    i = @index(Global, Linear)
+    @inbounds begin
+        d = steps * h[i]
+        for k in 1:size(f1, 1)
+            W[k, j, i] = (f1[k, i] - f0[k, i]) / d
+        end
+    end
+end
+
 # `mass_diag` is the diagonal of the mass matrix shared by every trajectory, or `nothing` for
 # the identity.
 @inline _mass_diagonal(::Nothing, j, W) = one(eltype(W))

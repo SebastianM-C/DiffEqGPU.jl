@@ -77,6 +77,66 @@ end
     end
 end
 
+@testset "Batched finite-difference Jacobian" begin
+    N, ntraj = 2, 5
+    u = rand(N, ntraj) .+ 0.5
+    p = reshape(collect(10.0:10.0:50.0), 1, :)
+    for f! in (vdp!, tabulated!), (central, rtol) in ((false, 1.0e-5), (true, 1.0e-8))
+        batched_f = (du, u, p, t) -> DiffEqGPU.gpu_kernel(backend)(
+            f!, du, u, p, t; ndrange = size(u, 2), workgroupsize = size(u, 2)
+        )
+        ud = adapt(backend, u)
+        J = DiffEqGPU.FDBatchedJacobian(batched_f, ud; central)
+        W = adapt(backend, zeros(N, N, ntraj))
+        J(W, ud, adapt(backend, p), 0.0)
+        Wh = Array(W)
+        for i in 1:ntraj
+            Jref = ForwardDiff.jacobian(
+                (du, x) -> f!(du, x, p[:, i], 0.0), zeros(N), u[:, i]
+            )
+            @test isapprox(Wh[:, :, i], Jref; rtol)
+        end
+        # The state is left as it was.
+        @test Array(ud) == u
+    end
+end
+
+@testset "The Jacobian follows the algorithm's `autodiff`" begin
+    ADTypes = DiffEqGPU.ADTypes
+    u0 = adapt(backend, zeros(3, 4))
+    f = (du, u, p, t) -> nothing
+    jac(ad) = DiffEqGPU.batched_jacobian(f, u0, (; autodiff = ad))
+    chunk(J) = ForwardDiff.npartials(eltype(J.ud))
+    @test chunk(jac(ADTypes.AutoForwardDiff())) == ForwardDiff.pickchunksize(3, 8)
+    @test chunk(jac(ADTypes.AutoForwardDiff(; chunksize = 1))) == 1
+    @test chunk(jac(ADTypes.AutoSparse(ADTypes.AutoForwardDiff(; chunksize = 2)))) == 2
+    @test !jac(ADTypes.AutoFiniteDiff()).central
+    @test jac(ADTypes.AutoFiniteDiff(; fdtype = Val(:central))).central
+    @test_throws ArgumentError jac(ADTypes.AutoFiniteDiff(; fdtype = Val(:complex)))
+    @test_throws ArgumentError jac(ADTypes.AutoEnzyme())
+end
+
+@testset "Stiff ODE without a Jacobian, $(nameof(typeof(alg))) with $name" for alg in (
+        Rodas5P, Rosenbrock23,
+    ), (name, ad, err) in (
+        ("chunk 1", DiffEqGPU.ADTypes.AutoForwardDiff(; chunksize = 1), 1.0e-7),
+        ("forward differences", DiffEqGPU.ADTypes.AutoFiniteDiff(), 1.0e-4),
+        ("central differences", DiffEqGPU.ADTypes.AutoFiniteDiff(; fdtype = Val(:central)), 1.0e-5),
+    )
+    prob_func = (pr, ctx) -> remake(pr; p = [mus[ctx.sim_id]])
+    kwargs = (; abstol = 1.0e-8, reltol = 1.0e-8, saveat = 0.1)
+    analytic = ensemble(
+        ODEProblem(ODEFunction(vdp!; jac = vdp_jac!), [2.0, 0.0], (0.0, 2.0), [10.0]),
+        prob_func, alg(); kwargs...
+    )
+    sol = ensemble(
+        ODEProblem(vdp!, [2.0, 0.0], (0.0, 2.0), [10.0]), prob_func, alg(; autodiff = ad);
+        kwargs...
+    )
+    @test all(s -> SciMLBase.successful_retcode(s), sol)
+    @test max_error(sol, analytic) < err
+end
+
 @testset "Stiff ODE without a Jacobian, $(nameof(typeof(alg)))" for alg in (
         Rodas5P(), Rosenbrock23(),
     )
