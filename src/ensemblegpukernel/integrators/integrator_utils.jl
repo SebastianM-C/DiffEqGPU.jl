@@ -313,7 +313,7 @@ end
     tmin, upcrossing, event_occurred, event_idx, idx, residual =
         _find_first_continuous_callback(integrator, 1, callbacks...)
     if event_occurred
-        integrator.last_event_error = DiffEqBase.value(residual)
+        integrator.last_event_error = SciMLBase.value(residual)
     end
     return tmin, upcrossing, event_occurred, event_idx, idx, length(callbacks)
 end
