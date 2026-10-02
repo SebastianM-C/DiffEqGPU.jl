@@ -101,8 +101,8 @@ end
 end
 
 @testset "Batched Wfact_t" begin
-    # W[:, :, i] = s_i J_i - M / γ, factorized without pivoting, where s_i = tf - t0 is the
-    # time scaling of the per-trajectory time span path (1 otherwise).
+    # W[:, :, i] = s_i J_i - M / γ, factorized with partial pivoting, where s_i = tf - t0 is
+    # the time scaling of the per-trajectory time span path (1 otherwise).
     N, ntraj, γ, tn = 3, 2, 0.1, 0.25
     u = [1.0 0.5; y0 0.3; 0.2 0.7]
     mass_diag = [2.0, 0.0, 1.0]
@@ -111,9 +111,8 @@ end
     function expected(i, scale)
         J = zeros(N, N)
         dae3_jac!(J, u[:, i], (pk[i],), 0.0)
-        return lu(scale * J - Diagonal(mass_diag) / γ, NoPivot()).factors
+        return lu(scale * J - Diagonal(mass_diag) / γ)
     end
-    Wt = DiffEqGPU.batched_Wfact_t(dae3_jac!, true, adapt(backend, mass_diag))
     for (p, scales) in (
             ([pk[1], pk[2]], (1.0, 1.0)),
             (
@@ -122,12 +121,47 @@ end
             ),
         )
         W = adapt(backend, zeros(N, N, ntraj))
+        ipiv = DiffEqGPU.lu_pivots(W)
+        Wt = DiffEqGPU.batched_Wfact_t(dae3_jac!, true, adapt(backend, mass_diag), ipiv)
         pb = p isa Vector{Float64} ? adapt(backend, reshape(p, 1, :)) : adapt(backend, p)
         Wt(W, adapt(backend, u), pb, γ, tn)
-        Wh = Array(W)
+        Wh, ipivh = Array(W), Array(ipiv)
         for i in 1:ntraj
-            @test Wh[:, :, i] ≈ expected(i, scales[i])
+            F = expected(i, scales[i])
+            @test Wh[:, :, i] ≈ F.factors
+            @test ipivh[:, i] == F.ipiv
         end
+    end
+end
+
+@testset "DAE whose iteration matrix needs pivoting" begin
+    # The first algebraic equation does not involve its own variable, so the diagonal of the
+    # iteration matrix J - M / γ has a structural zero in that row and an unpivoted
+    # factorization breaks down at the first step.
+    function zp!(du, u, p, t)
+        du[1] = -p[1] * u[1]
+        du[2] = u[3] - u[1]
+        du[3] = u[2] - 2 * u[3]
+        return nothing
+    end
+    function zp_jac!(J, u, p, t)
+        fill!(J, 0)
+        J[1, 1] = -p[1]
+        J[2, 1] = -1
+        J[2, 3] = 1
+        J[3, 2] = 1
+        J[3, 3] = -2
+        return nothing
+    end
+    f = ODEFunction(zp!; jac = zp_jac!, mass_matrix = Diagonal([1.0, 0.0, 0.0]))
+    prob = ODEProblem(f, [1.0, 2.0, 1.0], (0.0, 2.0), [1.0])
+    prob_func = (prob, ctx) -> remake(prob; p = [ks[ctx.sim_id]])
+    for (alg, err) in ((Rodas5P(), 1.0e-6), (Rosenbrock23(), 1.0e-5))
+        esol, cpu = compare_with_cpu(
+            prob, prob_func, alg; abstol = 1.0e-8, reltol = 1.0e-8, saveat = 0.5
+        )
+        @test all(s -> SciMLBase.successful_retcode(s), esol.u)
+        @test max_error(esol, cpu) < err
     end
 end
 

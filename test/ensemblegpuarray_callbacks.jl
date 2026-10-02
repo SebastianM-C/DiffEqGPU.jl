@@ -1,14 +1,14 @@
 using DiffEqGPU, Test
 using OrdinaryDiffEq: Tsit5, Rosenbrock23
 using SciMLBase: CallbackSet, ContinuousCallback, DiscreteCallback, EnsembleProblem,
-    ODEProblem, remake, solve
+    ODEFunction, ODEProblem, remake, solve
 
 include("utils.jl")
 
 const tol = 1.0e-9
 const algs = (Tsit5(), Rosenbrock23())
-# The batch shares one step size, chosen from an error norm over all trajectories, so a
-# trajectory does not get exactly its own steps. The low-order Rosenbrock23 shows that most.
+# The batch shares one step size, set by the hardest trajectory, so a trajectory does not
+# get exactly its own steps. The low-order Rosenbrock23 shows that most.
 state_tolerance(::Tsit5) = 1.0e-6
 state_tolerance(::Rosenbrock23) = 1.0e-4
 
@@ -27,11 +27,13 @@ max_state_error(sols, refs) = maximum(
 
 # u' = -k u, u(0) = 1: crosses 0.5 once (downward) for every k > 0.
 decay(du, u, p, t) = (du[1] = -p[1] * u[1]; nothing)
+decay_jac(J, u, p, t) = (J[1, 1] = -p[1]; nothing)
 decay_condition(u, t, integrator) = u[1] - 0.5
 bump!(integrator) = (integrator.u[1] += 0.3; nothing)
 ks = [0.5, 1.0, 1.5, 2.0]
 decay_prob_func = (prob, ctx) -> remake(prob; p = [ks[ctx.sim_id]])
-decay_prob = ODEProblem(decay, [1.0], (0.0, 3.0), [1.0])
+# Stiff methods on `EnsembleGPUArray` need the Jacobian.
+decay_prob = ODEProblem(ODEFunction(decay; jac = decay_jac), [1.0], (0.0, 3.0), [1.0])
 bump = ContinuousCallback(decay_condition, bump!; save_positions = (false, false))
 
 @testset "`callback` keyword is applied ($(nameof(typeof(alg))))" for alg in algs
@@ -75,6 +77,7 @@ end
 # affect shifts the "gear" p[1] from 1 to 2) and later downward (no affect); amp = 0.4 never
 # crosses and must keep its parameters.
 geared(du, u, p, t) = (du[1] = p[1] * p[2] * cos(t); nothing)
+geared_jac(J, u, p, t) = (J[1, 1] = 0; nothing)
 shift_condition(u, t, integrator) = u[1] - 0.5
 shift_up!(integrator) = (integrator.p[1] += 1; nothing)
 amps = [1.0, 0.8, 0.6, 0.4]
@@ -84,7 +87,9 @@ geared_prob_func = (prob, ctx) -> remake(prob; p = [1.0, amps[ctx.sim_id]])
     shift = ContinuousCallback(
         shift_condition, shift_up!, nothing; save_positions = (false, false)
     )
-    prob = ODEProblem(geared, [0.0], (0.0, 3.0), [1.0, 1.0]; callback = shift)
+    prob = ODEProblem(
+        ODEFunction(geared; jac = geared_jac), [0.0], (0.0, 3.0), [1.0, 1.0]; callback = shift
+    )
     eprob = EnsembleProblem(prob; prob_func = geared_prob_func, safetycopy = false)
     sol = solve(
         eprob, alg, EnsembleGPUArray(backend, 0.0); trajectories = length(amps),
