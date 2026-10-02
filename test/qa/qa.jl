@@ -92,6 +92,9 @@ run_qa(
                 # DiffEqGPU's opt-out hook for the cooperative batched `ldiv!`, which the
                 # JLArrays extension turns off.
                 :cooperative_ldiv,
+                # The per-trajectory stepper's periodic-callback form and its switch, which the
+                # DiffEqCallbacks extension builds and reads.
+                :LanePeriodic, :_per_trajectory_dt,
                 # DiffEqGPU's ModelingToolkit hooks and internal problem types that the
                 # ModelingToolkitBase extension implements or builds.
                 :ImmutableSCCBlock, :ImmutableSCCNonlinearProblem, :final_parameters,

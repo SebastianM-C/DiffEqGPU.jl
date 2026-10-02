@@ -734,24 +734,43 @@ end
 # and parameters `p` of the trajectories `probs`. Returns the saved times, the saved states
 # (N × nsave × B, on the host), the number of saves per lane, the lane statuses and the step
 # counts.
-function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
-    _check_lane_algorithm(alg)
-    prob = probs[1]
-    backend = ensemblealg.backend
-    opts = _lane_options(prob, kwargs)
-    central = _lane_jacobian_mode(alg)
-    T = eltype(u0)
-    t0, tf = prob.tspan
-    Tt = promote_type(typeof(t0), typeof(tf))
-    t0 = Tt(t0)
-    tf = Tt(tf)
-    tf > t0 || throw(ArgumentError("`per_trajectory_dt = true` needs a forward time span."))
-    N, B = size(u0)
-    iip = Val(DiffEqBase.isinplace(prob))
-    f = prob.f.f
+"""
+    DiffEqGPU.check_per_trajectory_dt(prob, alg, ensemblealg; adaptive = true, kwargs...)
 
-    abstol = T(_lane_scalar_tolerance(get(opts, :abstol, 1 // 10^6), :abstol))
-    reltol = T(_lane_scalar_tolerance(get(opts, :reltol, 1 // 10^3), :reltol))
+Throw the `ArgumentError` that solving the trajectories of `prob` with `alg` on
+`ensemblealg` (an `EnsembleGPUArray` with `per_trajectory_dt = true`) and the solve keywords
+`kwargs` would throw for an unsupported setting, without solving anything; return `nothing`
+otherwise. It checks the algorithm (`Rodas5P` with a forward or central finite-difference
+Jacobian), the mass matrix (diagonal), the solve options (including those stored in
+`prob.kwargs`), scalar tolerances, the saving options, the callbacks (DiffEqCallbacks'
+`PeriodicCallback`s with `save_positions = (false, false)`, at most 32) and the time span
+(forward). Callers that build the problems of an ensemble can call it once on the base
+problem, before preparing the trajectories. A check that needs all trajectories, such as
+their time spans being equal, still happens in the solve.
+"""
+function check_per_trajectory_dt(prob, alg, ensemblealg; kwargs...)
+    _lane_settings(prob, alg, ensemblealg; kwargs...)
+    return nothing
+end
+
+# Every check of the per-trajectory path, and the settings they resolve.
+function _lane_settings(prob, alg, ensemblealg; adaptive = true, kwargs...)
+    _per_trajectory_dt(ensemblealg) || throw(
+        ArgumentError(
+            "the per-trajectory stepper needs `EnsembleGPUArray(...; per_trajectory_dt = true)`; got `$(nameof(typeof(ensemblealg)))` without it."
+        )
+    )
+    adaptive || throw(
+        ArgumentError("`per_trajectory_dt = true` needs an adaptive solve (`adaptive = true`).")
+    )
+    _check_lane_algorithm(alg)
+    central = _lane_jacobian_mode(alg)
+    _mass_matrix_diagonal(prob.f.mass_matrix, length(prob.u0))
+    opts = _lane_options(prob, kwargs)
+    t0, tf = prob.tspan
+    tf > t0 || throw(ArgumentError("`per_trajectory_dt = true` needs a forward time span."))
+    abstol = _lane_scalar_tolerance(get(opts, :abstol, 1 // 10^6), :abstol)
+    reltol = _lane_scalar_tolerance(get(opts, :reltol, 1 // 10^3), :reltol)
     saveat = get(opts, :saveat, ())
     save_everystep = get(opts, :save_everystep, isempty(saveat))
     if save_everystep && isempty(saveat)
@@ -763,13 +782,37 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
     end
     save_start = get(opts, :save_start, saveat isa Number || isempty(saveat) || t0 in saveat)
     save_end = get(opts, :save_end, true)
-    savet = Tt.(_lane_save_times(saveat, save_start, save_end, t0, tf))
-    dtmax = Tt(get(opts, :dtmax, tf - t0))
-    maxiters = Int32(get(opts, :maxiters, 100_000))
-    restore_stop_dt = Bool(get(opts, :restore_stop_dt, false))
-    dtmin = eps(max(abs(t0), abs(tf)))
     callbacks = _lane_callbacks(prob, ensemblealg; kwargs...)
-    stops, stop_mask = _lane_stops(callbacks, get(opts, :tstops, ()), t0, tf, Tt)
+    return (;
+        opts, central, abstol, reltol, saveat, save_start, save_end, callbacks,
+        dtmax = get(opts, :dtmax, tf - t0), maxiters = get(opts, :maxiters, 100_000),
+        restore_stop_dt = Bool(get(opts, :restore_stop_dt, false)), tstops = get(opts, :tstops, ()),
+    )
+end
+
+function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
+    prob = probs[1]
+    set = _lane_settings(prob, alg, ensemblealg; kwargs...)
+    backend = ensemblealg.backend
+    opts = set.opts
+    central = set.central
+    T = eltype(u0)
+    t0, tf = prob.tspan
+    Tt = promote_type(typeof(t0), typeof(tf))
+    t0 = Tt(t0)
+    tf = Tt(tf)
+    N, B = size(u0)
+    iip = Val(DiffEqBase.isinplace(prob))
+    f = prob.f.f
+    abstol = T(set.abstol)
+    reltol = T(set.reltol)
+    savet = Tt.(_lane_save_times(set.saveat, set.save_start, set.save_end, t0, tf))
+    dtmax = Tt(set.dtmax)
+    maxiters = Int32(set.maxiters)
+    restore_stop_dt = set.restore_stop_dt
+    dtmin = eps(max(abs(t0), abs(tf)))
+    callbacks = set.callbacks
+    stops, stop_mask = _lane_stops(callbacks, set.tstops, t0, tf, Tt)
 
     _, mass_diag = batched_mass_matrix(prob.f.mass_matrix, u0)
     isdae = mass_diag !== nothing && any(iszero, Array(mass_diag))
