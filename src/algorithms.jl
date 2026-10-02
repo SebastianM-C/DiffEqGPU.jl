@@ -146,6 +146,18 @@ of that trajectory would be initialized:
 
 The batched problem itself is solved without initialization.
 
+# ModelingToolkit parameters
+
+Problems whose parameters are ModelingToolkit `MTKParameters` are batched by portion. The
+tunable and discrete portions are stored per trajectory; the constant portion is uploaded
+once and shared by all trajectories, so it must be the same in every trajectory (an
+`ArgumentError` names the portion otherwise; make the parameters a sweep varies tunable,
+for example with `ModelingToolkit.subset_tunables`). The nonnumeric and caches portions must
+be empty. Floating-point buffers take the floating-point type of the state. The initials
+portion is not uploaded: only initialization reads it. Each returned solution carries the
+discrete values its trajectory ended with in `sol.prob.p`, so callbacks that write discretes
+are visible after the solve; the timeseries of discretes is not saved.
+
 !!! warn
 
     Callbacks with `terminate!` do not work well with `EnsembleGPUArray` because the entire

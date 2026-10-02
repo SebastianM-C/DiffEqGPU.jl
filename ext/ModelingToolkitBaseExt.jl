@@ -1,13 +1,178 @@
 module ModelingToolkitBaseExt
 
-using ModelingToolkitBase: MTKParameters, System, unknowns
+using ModelingToolkitBase: ModelingToolkitBase, BlockedArray, MTKParameters, System,
+    unknowns
 using Adapt: adapt
 import DiffEqGPU
+import Adapt
+using StaticArraysCore: SVector
 import SciMLBase
+
+const SciMLStructures = ModelingToolkitBase.SciMLStructures
+const BlockArrays = parentmodule(BlockedArray)
 
 const MTKPARAMETERS_PORTIONS = (
     :tunable, :initials, :discrete, :constant, :nonnumeric, :caches,
 )
+
+## Batched `MTKParameters` for `EnsembleGPUArray`
+
+# A vector of vectors of different lengths, stored as one flat buffer so it can live on the
+# device: element `i` is `data[(offsets[i] + 1):offsets[i + 1]]`, returned as a view.
+struct RaggedVector{V, D, O} <: AbstractVector{V}
+    data::D
+    offsets::O
+end
+# The element type is computed rather than taken from a `view`, because the constructor also
+# runs inside kernels (KernelAbstractions rebuilds `@Const` arguments there), where a view's
+# bounds check cannot be compiled.
+function RaggedVector(data::D, offsets::O) where {D, O}
+    V = SubArray{eltype(D), 1, D, Tuple{UnitRange{Int}}, true}
+    return RaggedVector{V, D, O}(data, offsets)
+end
+function RaggedVector(::Type{T}, vs::AbstractVector{<:AbstractVector}) where {T}
+    offsets = zeros(Int, length(vs) + 1)
+    for (i, v) in enumerate(vs)
+        offsets[i + 1] = offsets[i] + length(v)
+    end
+    data = Vector{T}(undef, offsets[end])
+    for (i, v) in enumerate(vs)
+        copyto!(data, offsets[i] + 1, v, 1, length(v))
+    end
+    return RaggedVector(data, offsets)
+end
+Base.size(r::RaggedVector) = (length(r.offsets) - 1,)
+Base.@propagate_inbounds function Base.getindex(r::RaggedVector, i::Int)
+    return view(r.data, (r.offsets[i] + 1):r.offsets[i + 1])
+end
+function Adapt.adapt_structure(to, r::RaggedVector)
+    return RaggedVector(Adapt.adapt(to, r.data), Adapt.adapt(to, r.offsets))
+end
+
+# The `MTKParameters` of a batch of trajectories. The tunable and discrete portions are
+# stored per trajectory, as one column each; everything else is a single copy shared by all
+# trajectories. Indexing with a trajectory number gives that trajectory's `MTKParameters`,
+# whose tunable and discrete buffers are views into its columns, so a callback writing a
+# discrete writes the batched storage.
+struct BatchedMTKParameters{T, D, A, I, S} <: AbstractVector{Any}
+    # ntunable × ntraj
+    tunable::T
+    # One ndiscrete × ntraj matrix per discrete partition (clock)
+    discrete::D
+    # The block axes of each discrete partition, or `nothing` for an unblocked one
+    discrete_axes::A
+    # An empty buffer standing in for the initials, which only initialization reads
+    initials::I
+    # (constant, nonnumeric, caches)
+    shared::S
+end
+Base.size(b::BatchedMTKParameters) = (size(b.tunable, 2),)
+Base.@propagate_inbounds function Base.getindex(b::BatchedMTKParameters, i::Int)
+    discrete = map((d, ax) -> discrete_column(d, ax, i), b.discrete, b.discrete_axes)
+    constant, nonnumeric, caches = b.shared
+    return MTKParameters(
+        view(b.tunable, :, i), b.initials, discrete, constant, nonnumeric, caches
+    )
+end
+Base.@propagate_inbounds discrete_column(d, ::Nothing, i) = view(d, :, i)
+Base.@propagate_inbounds discrete_column(d, axes, i) = BlockedArray(view(d, :, i), axes)
+
+# The block axes are static, so they need no adapting.
+function Adapt.adapt_structure(to, b::BatchedMTKParameters)
+    return BatchedMTKParameters(
+        Adapt.adapt(to, b.tunable), Adapt.adapt(to, b.discrete), b.discrete_axes,
+        Adapt.adapt(to, b.initials), Adapt.adapt(to, b.shared)
+    )
+end
+
+# Floating-point buffers take the floating-point type of the batched state; integer and
+# `Bool` buffers keep theirs.
+convert_float(::Type{T}, x::AbstractArray{<:AbstractFloat}) where {T} = T.(x)
+convert_float(::Type, x::AbstractArray) = Array(x)
+
+# One column per trajectory. `stack` keeps a single trajectory, and an empty portion, a matrix.
+batch_columns(::Type{T}, cols) where {T} = stack(convert_float(T, Array(c)) for c in cols)
+
+static_axis(ax) = isbits(ax) ? ax : BlockArrays.BlockedOneTo(SVector{length(ax.lasts)}(ax.lasts))
+static_axes(x::BlockedArray) = map(static_axis, axes(x))
+static_axes(x) = nothing
+
+function shared_buffer(::Type{T}, portion, x::AbstractVector{<:Number}) where {T}
+    return convert_float(T, x isa BitArray ? Vector{Bool}(x) : x)
+end
+function shared_buffer(::Type{T}, portion, x::AbstractVector{<:AbstractVector{<:Number}}) where {T}
+    S = isempty(x) || eltype(eltype(x)) <: AbstractFloat ? T : eltype(eltype(x))
+    return RaggedVector(S, x)
+end
+function shared_buffer(::Type, portion, x)
+    throw(
+        ArgumentError(
+            "EnsembleGPUArray cannot upload a `$(typeof(x))` buffer from the $portion portion of `MTKParameters` to the device. Only vectors of numbers and vectors of numeric vectors are supported there."
+        )
+    )
+end
+
+# A portion holding no buffers, or only empty ones, has nothing for the device.
+function empty_portion(portion, x::Tuple)
+    all(isempty, x) && return ()
+    throw(
+        ArgumentError(
+            "EnsembleGPUArray does not support `MTKParameters` with a non-empty $portion portion: it holds $(join(map(b -> string(typeof(b)), filter(!isempty, collect(x))), ", ")). Keep such values out of the parameters, for example by making them constants of a numeric type."
+        )
+    )
+end
+
+# Everything except the tunable and discrete portions is uploaded once, from the first
+# trajectory, so it has to be the same in every trajectory. The initials are exempt: they
+# can differ after per-trajectory initialization, and only initialization reads them.
+function check_shared_portions(ps)
+    p1 = first(ps)
+    for portion in (:constant, :nonnumeric, :caches)
+        ref = getproperty(p1, portion)
+        i = findfirst(ps) do p
+            x = getproperty(p, portion)
+            !(x === ref || isequal(x, ref))
+        end
+        i === nothing && continue
+        throw(
+            ArgumentError(
+                "EnsembleGPUArray batches only the tunable and discrete portions of `MTKParameters`, and shares the others between all trajectories, but the $portion portion of trajectory $i differs from that of the first trajectory. Make the parameters that vary between trajectories tunable (for example with `ModelingToolkit.subset_tunables`), or solve trajectories with different $portion values in separate ensembles."
+            )
+        )
+    end
+    return nothing
+end
+
+function DiffEqGPU.pack_parameters(p1::MTKParameters, probs, ::Type{T}) where {T}
+    ps = map(prob -> prob.p, probs)
+    check_shared_portions(ps)
+    tunable = batch_columns(T, map(p -> p.tunable, ps))
+    discrete = ntuple(k -> batch_columns(T, map(p -> p.discrete[k], ps)), length(p1.discrete))
+    discrete_axes = map(static_axes, p1.discrete)
+    constant = map(x -> shared_buffer(T, :constant, x), p1.constant)
+    nonnumeric = empty_portion(:nonnumeric, p1.nonnumeric)
+    caches = empty_portion(:caches, p1.caches)
+    return BatchedMTKParameters(
+        tunable, discrete, discrete_axes, T[], (constant, nonnumeric, caches)
+    )
+end
+
+# The discrete portion is the one callbacks change. Read it back once per batch and give each
+# trajectory whose discretes changed new parameters holding the final values.
+function DiffEqGPU.final_parameters(b::BatchedMTKParameters, probs)
+    isempty(b.discrete) && return map(prob -> prob.p, probs)
+    discrete = map(Array, b.discrete)
+    return map(eachindex(probs)) do i
+        p = probs[i].p
+        initial = collect(SciMLStructures.canonicalize(SciMLStructures.Discrete(), p)[1])
+        final = reduce(vcat, map(d -> d[:, i], discrete))
+        # Compare in the batch's precision, so the rounding of the upload is no change
+        final == oftype(final, initial) && return p
+        return SciMLStructures.replace(
+            SciMLStructures.Discrete(), p, convert(Vector{eltype(initial)}, final)
+        )
+    end
+end
 
 function DiffEqGPU.make_parameter_compatible(p::MTKParameters)
     compatible = MTKParameters(

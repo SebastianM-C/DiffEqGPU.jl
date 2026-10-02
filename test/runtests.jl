@@ -96,6 +96,9 @@ if GROUP in SUPPORTS_LUFACT
     @time @safetestset "EnsembleGPUArray mass matrices" begin
         include("ensemblegpuarray_mass_matrix.jl")
     end
+    @time @safetestset "EnsembleGPUArray MTKParameters" begin
+        include("ensemblegpuarray_mtkparameters.jl")
+    end
 end
 
 # EnsembleGPUArray kernels has Int64 arguments, causing them to fail with Metal and oneAPI
@@ -162,6 +165,9 @@ if GROUP == "CPU"
     end
     @time @safetestset "EnsembleGPUArray initialization" begin
         include("ensemblegpuarray_initialization.jl")
+    end
+    @time @safetestset "EnsembleGPUArray MTKParameters" begin
+        include("ensemblegpuarray_mtkparameters.jl")
     end
     @time @safetestset "Adaptive endpoint termination" begin
         include("gpu_kernel_de/adaptive_endpoint.jl")

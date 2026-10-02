@@ -374,8 +374,14 @@ function _batch_solve_array(
             )
         end
 
-        # Requires prob.p to be isbits otherwise it wouldn't work with ParamWrapper
-        @assert all(prob -> isbits(prob.p), probs)
+        # Each trajectory's parameters travel inside a `ParamWrapper`, which must be isbits
+        if !all(prob -> isbits(prob.p), probs)
+            throw(
+                ArgumentError(
+                    "EnsembleGPUArray solves trajectories with different time spans only when every problem's parameters are isbits; got a `$(nameof(typeof(probs[findfirst(prob -> !isbits(prob.p), probs)].p)))`. Give every trajectory the same `tspan`, or use isbits parameters such as a tuple or an `SVector`."
+                )
+            )
+        end
 
         # Remaking the problem to normalize time span values..."
         p = _hcat_batch([ParamWrapper(probs[i].p, probs[i].tspan) for i in 1:length(I)])
@@ -416,17 +422,17 @@ function _batch_solve_array(
                 for i in 1:length(probs)
         ]
     else
-        p = pack_ordinary_parameters(probs)
+        p = pack_parameters(probs, float(eltype(u0)))
         sol,
             solus = batch_solve_up(
             ensembleprob, probs, alg, ensemblealg, I, u0, p;
             adaptive, kwargs...
         )
-        final_p = final_batch_parameters(sol.prob.p)
+        ps = final_parameters(sol.prob.p, probs)
         [
             ensembleprob.output_func(
                     SciMLBase.build_solution(
-                        final_trajectory_problem(probs[i], final_p, i), alg, sol.t,
+                        with_parameters(probs[i], ps[i]), alg, sol.t,
                         solus[i],
                         stats = sol.stats,
                         retcode = sol.retcode

@@ -27,26 +27,6 @@ end
 batched_lufact!(backend, W, ::Nothing) = lufact!(backend, W)
 batched_lufact!(backend, W, ipiv) = lufact!(backend, W, ipiv)
 
-# Callbacks write into the batched `nparam × ntraj` parameter matrix in place. Read it back
-# once per batch so each returned solution can carry its trajectory's final parameters.
-final_batch_parameters(p::AbstractMatrix{<:Number}) = Array(p)
-final_batch_parameters(p) = nothing
-
-# Only the matrix layout of `pack_ordinary_parameters` exposes mutable per-trajectory
-# parameters to affects; scalar and non-numeric batches reach the affect as values.
-final_trajectory_problem(prob, ::Nothing, i) = prob
-function final_trajectory_problem(prob, final_p::AbstractMatrix, i)
-    p = prob.p
-    p isa AbstractVector{<:Number} && length(p) == size(final_p, 1) || return prob
-    column = @view final_p[:, i]
-    all(isequal.(p, column)) && return prob
-    return remake(prob; p = restructure_parameters(p, column))
-end
-
-restructure_parameters(p::StaticArrays.StaticArray, column) =
-    similar_type(p)(column)
-restructure_parameters(p, column) = copyto!(similar(p), column)
-
 # The mass matrix of one trajectory, as the vector of its diagonal, or `nothing` for the
 # identity. `EnsembleGPUArray` only supports mass matrices it can apply per trajectory without
 # coupling the columns of the batched state, which means diagonal ones.
@@ -123,6 +103,40 @@ function batched_Wfact_t(jac, isinplace, mass_diag, ipiv)
         return batched_lufact!(version, W, ipiv)
     end
 end
+# Pack the per-trajectory parameters of `probs` into the batched parameter object of an
+# `EnsembleGPUArray` solve. `T` is the floating-point type of the batched state. Extensions
+# add methods dispatching on the parameter type of the first problem:
+# `ModelingToolkitBaseExt` batches `MTKParameters`.
+pack_parameters(probs, ::Type{T}) where {T} = pack_parameters(first(probs).p, probs, T)
+pack_parameters(p, probs, ::Type) = pack_ordinary_parameters(probs)
+
+# The parameters each trajectory ends the solve with, read back from the batched parameter
+# object `p` after the solve (callbacks may have changed them), as a vector with one entry
+# per problem in `probs`. By default the parameters are the ones the trajectories started
+# with.
+final_parameters(p, probs) = map(prob -> prob.p, probs)
+
+# `prob` with its parameters replaced by `p`, without the initialization `remake` would run.
+with_parameters(prob, p) = p === prob.p ? prob : @set prob.p = p
+
+# Callbacks write into the batched `nparam × ntraj` parameter matrix in place, so the
+# trajectories end with the columns read back here. Only that layout exposes mutable
+# per-trajectory parameters to affects; scalar and non-numeric batches reach the affect as
+# values.
+function final_parameters(p::AbstractMatrix{<:Number}, probs)
+    final_p = Array(p)
+    return map(eachindex(probs)) do i
+        p0 = probs[i].p
+        p0 isa AbstractVector{<:Number} && length(p0) == size(final_p, 1) || return p0
+        column = @view final_p[:, i]
+        return all(isequal.(p0, column)) ? p0 : restructure_parameters(p0, column)
+    end
+end
+
+restructure_parameters(p::StaticArrays.StaticArray, column) =
+    similar_type(p)(column)
+restructure_parameters(p, column) = copyto!(similar(p), column)
+
 
 function generate_problem(
         prob::SciMLBase.AbstractODEProblem,
