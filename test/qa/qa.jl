@@ -52,7 +52,7 @@ run_qa(
                 :is_trivial_initialization, :specialization, :tighten_container_eltype,
                 # ForwardDiff differentiation API (documented but not `public`)
                 :Chunk, :Dual, :Partials, :construct_seeds, :derivative, :jacobian,
-                :npartials, :partials, :value,
+                :npartials, :partials, :pickchunksize, :value,
                 # LinearSolve cache/algorithm extension interface (not `public`)
                 :LinearCache, :SciMLLinearSolveAlgorithm, :init_cacheval,
                 :needs_concrete_A,
