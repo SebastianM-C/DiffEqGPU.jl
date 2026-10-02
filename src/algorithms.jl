@@ -24,7 +24,7 @@ solve(ensemble_prob, Tsit5(), ensemblealg; trajectories = 100)
 struct EnsembleCPUArray <: EnsembleArrayAlgorithm end
 
 """
-    EnsembleGPUArray(backend, cpu_offload = 0.2; threaded_host = false)
+    EnsembleGPUArray(backend, cpu_offload = 0.2; threaded_host = false, per_trajectory_dt = false)
 
 An `EnsembleArrayAlgorithm` that uses one kernel per trajectory while storing the
 trajectories in a batched array. This is the appropriate choice when the ODE solver or
@@ -35,6 +35,7 @@ right-hand side cannot be compiled into one fused `EnsembleGPUKernel` solve.
   - `backend`: the `KernelAbstractions` backend used for the batched computation.
   - `cpu_offload`: the fraction of trajectories solved on the CPU. The default is `0.2`.
   - `threaded_host`: whether the host-side preparation of each batch runs on several threads.
+  - `per_trajectory_dt`: whether every trajectory takes its own adaptive steps.
 
 # Arguments
 
@@ -52,6 +53,9 @@ right-hand side cannot be compiled into one fused `EnsembleGPUKernel` solve.
     `safetycopy = false` it must return a problem that does not share mutable state with
     the other trajectories (`remake` gives a new problem). Defaults to `false`, which
     prepares the trajectories in order on the calling thread.
+  - `per_trajectory_dt`: when `true`, every trajectory keeps its own time, step size and
+    step acceptance, instead of the whole batch advancing with one shared step; see
+    "Per-trajectory steps" below. Supports `Rodas5P` only. Defaults to `false`.
 
 # Returns
 
@@ -211,6 +215,42 @@ solve of its own. The shared step is therefore the one the hardest trajectory ne
 mixing easy and hard trajectories takes as many steps as the hard ones. Pass
 `internalnorm` to `solve` to replace this norm; it receives the batched state array.
 
+# Per-trajectory steps
+
+With `per_trajectory_dt = true`, DiffEqGPU integrates the batch with its own `Rodas5P`
+stepper instead of OrdinaryDiffEq's integrator. Every trajectory has its own time, step
+size, step-size controller and step acceptance; the batch still shares the kernel launches,
+and a step attempt is computed for all unfinished trajectories at once. Each trajectory
+then takes the steps a solve of its own would take, with OrdinaryDiffEq's `Rodas5P`
+defaults (the PI controller, the initial step size), so a batch of easy and hard
+trajectories no longer advances at the pace of the hardest one. Because the shared step is
+set by the hardest trajectory, it also makes the other trajectories more accurate than
+their tolerances ask for; per-trajectory steps give each trajectory the accuracy of its own
+solve, so compare the two at matched achieved error, not at equal tolerance.
+
+A trajectory that fails (`ReturnCode.Unstable`, `DtLessThanMin`, `MaxIters`) stops alone; the
+others continue. Supported: `Rodas5P` with `autodiff = AutoFiniteDiff()` (forward or central
+differences), diagonal mass matrices including singular ones, scalar `abstol` and `reltol`,
+`saveat` (or `save_everystep = false`), `save_start`, `save_end`, `dt`, `dtmax`, `tstops`,
+`maxiters`, and DiffEqCallbacks' `PeriodicCallback`s, including those of ModelingToolkit's
+periodic events, with `save_positions = (false, false)`. Other callbacks and options throw an
+`ArgumentError`. Saved values between two steps are interpolated with `Rodas5P`'s dense
+output; at a time where a periodic affect fires, the value before the affect is saved, as
+OrdinaryDiffEq does with `save_positions = (false, false)`.
+
+By default the step-size control is OrdinaryDiffEq's, including how it continues after a step
+was shortened to land on a stop (a `tstops` entry or a periodic callback's time): the next
+step grows from the shortened step, because OrdinaryDiffEq shortens twice per step and its
+restore of the proposal before shortening then restores the shortened step. The `solve`
+keyword `restore_stop_dt = true` (an opt-in, `false` by default) continues from the proposal
+before shortening instead. On problems with dense stops, such as a clocked controller that
+stops every few steps, this avoids regrowing the step after every stop: on a 124-unknown
+DAE with a 10 ms clock it took about 27% fewer steps (rejected ones included) at
+equal tolerance and about 1.2 times fewer at matched achieved error, without more rejected
+steps. The step after a stop is then sized for the error of a full step although the
+shortened step's error estimate was smaller, so its achieved error can be slightly larger at
+a given tolerance; compare the two at matched error, not at equal tolerance.
+
 # Examples
 
 ```julia
@@ -238,10 +278,13 @@ struct EnsembleGPUArray{Backend} <: EnsembleArrayAlgorithm
     backend::Backend
     cpu_offload::Float64
     threaded_host::Bool
+    per_trajectory_dt::Bool
 end
 
-function EnsembleGPUArray(backend, cpu_offload; threaded_host::Bool = false)
-    return EnsembleGPUArray(backend, Float64(cpu_offload), threaded_host)
+function EnsembleGPUArray(
+        backend, cpu_offload; threaded_host::Bool = false, per_trajectory_dt::Bool = false
+    )
+    return EnsembleGPUArray(backend, Float64(cpu_offload), threaded_host, per_trajectory_dt)
 end
 
 """
@@ -335,8 +378,8 @@ cpu_alg = Dict(
 
 # Work around the fact that Zygote cannot handle the task system
 # Work around the fact that Zygote isderiving fails with constants?
-function EnsembleGPUArray(dev; threaded_host::Bool = false)
-    return EnsembleGPUArray(dev, 0.2; threaded_host)
+function EnsembleGPUArray(dev; threaded_host::Bool = false, per_trajectory_dt::Bool = false)
+    return EnsembleGPUArray(dev, 0.2; threaded_host, per_trajectory_dt)
 end
 
 function EnsembleGPUKernel(dev)

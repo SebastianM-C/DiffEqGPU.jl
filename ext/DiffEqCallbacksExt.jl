@@ -36,6 +36,14 @@ function DiffEqGPU.batched_time_callback(callback::DiscreteCallback, ensemblealg
         )
     end
     initialize = default_initialize ? (;) : (; initialize = user_initialize)
+    if DiffEqGPU._per_trajectory_dt(ensemblealg)
+        # The per-trajectory stepper schedules the stops and applies the affect itself.
+        return DiffEqGPU.LanePeriodic(
+            periodic.affect!, periodic.Δt, getfield(init, :phase),
+            getfield(init, :initial_affect), getfield(condition, :final_affect),
+            Tuple(callback.save_positions)
+        )
+    end
     return PeriodicCallback(
         DiffEqGPU.batched_affect(periodic.affect!), periodic.Δt;
         phase = getfield(init, :phase),

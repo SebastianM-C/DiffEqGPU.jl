@@ -356,6 +356,16 @@ function _batch_solve_array(
     )
     u0 = _hcat_batch([Array(probs[i].u0) for i in 1:length(I)])
 
+    if _per_trajectory_dt(ensemblealg)
+        adaptive || throw(
+            ArgumentError("`per_trajectory_dt = true` needs an adaptive solve (`adaptive = true`).")
+        )
+        return _batch_solve_lanes(
+            ensembleprob, alg, ensemblealg, I, probs, u0;
+            sim_seeds, rng_func, master_rng, kwargs...
+        )
+    end
+
     return if !all(
             Base.Fix2(
                 (prob1, prob2) -> isequal(prob1.tspan, prob2.tspan),

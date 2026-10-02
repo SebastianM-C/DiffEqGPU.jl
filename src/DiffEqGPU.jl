@@ -20,6 +20,7 @@ using LinearAlgebra: LinearAlgebra, Diagonal, I, LowerTriangular, NoPivot, RowMa
 using Distributed: Distributed, nprocs, pmap
 using ForwardDiff: ForwardDiff
 using ADTypes: ADTypes
+using FastPower: fastpower
 import ChainRulesCore
 import ChainRulesCore: NoTangent
 using RecursiveArrayTools: RecursiveArrayTools, VectorOfArray
@@ -237,6 +238,7 @@ include("ensemblegpukernel/tableaus/kvaerno_tableaus.jl")
 include("utils.jl")
 include("algorithms.jl")
 include("ensemblegpuarray/initialization.jl")
+include("ensemblegpuarray/lanes.jl")
 include("solve.jl")
 export EnsembleProblem, EnsembleSolution, EnsembleSerial, EnsembleThreads,
     EnsembleDistributed
