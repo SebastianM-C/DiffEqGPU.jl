@@ -24,7 +24,7 @@ solve(ensemble_prob, Tsit5(), ensemblealg; trajectories = 100)
 struct EnsembleCPUArray <: EnsembleArrayAlgorithm end
 
 """
-    EnsembleGPUArray(backend, cpu_offload = 0.2)
+    EnsembleGPUArray(backend, cpu_offload = 0.2; threaded_host = false)
 
 An `EnsembleArrayAlgorithm` that uses one kernel per trajectory while storing the
 trajectories in a batched array. This is the appropriate choice when the ODE solver or
@@ -34,6 +34,7 @@ right-hand side cannot be compiled into one fused `EnsembleGPUKernel` solve.
 
   - `backend`: the `KernelAbstractions` backend used for the batched computation.
   - `cpu_offload`: the fraction of trajectories solved on the CPU. The default is `0.2`.
+  - `threaded_host`: whether the host-side preparation of each batch runs on several threads.
 
 # Arguments
 
@@ -42,6 +43,15 @@ right-hand side cannot be compiled into one fused `EnsembleGPUKernel` solve.
   - `cpu_offload`: the fraction of trajectories to offload to CPU execution. The
     two-argument constructor stores this value as a `Float64`; the one-argument constructor
     defaults to `0.2`.
+
+# Keyword Arguments
+
+  - `threaded_host`: when `true`, the `prob_func` calls and the host-side initialization of
+    the trajectories of a batch run in `Threads.@threads`, one task per trajectory. This
+    requires `prob_func` to be thread-safe: it must not mutate shared state, and with
+    `safetycopy = false` it must return a problem that does not share mutable state with
+    the other trajectories (`remake` gives a new problem). Defaults to `false`, which
+    prepares the trajectories in order on the calling thread.
 
 # Returns
 
@@ -86,9 +96,9 @@ This introduces the following limitations on its usage:
     trajectories use the mass matrix of the first one.
   - A singular mass matrix (a DAE with algebraic variables) is supported with Rosenbrock
     methods, such as `Rosenbrock23` and `Rodas5P`, and throws an `ArgumentError` with other
-    algorithms. The trajectories are not initialized: each `u0` must already satisfy the
-    algebraic equations. With a mass matrix, the batched solve uses
-    `initializealg = NoInit()` unless an `initializealg` is passed.
+    algorithms. Each trajectory is initialized on the host (see Initialization below); a
+    problem without initialization data must have a `u0` that satisfies the algebraic
+    equations, which `initializealg = CheckInit()` verifies per trajectory.
   - The per-trajectory iteration matrices are factorized with partial pivoting, so DAEs whose
     algebraic equations have a zero on the diagonal of their Jacobian are supported.
   - To use multiple GPUs over clusters, one must manually set up one process per GPU. See
@@ -113,6 +123,28 @@ All trajectories share one integrator, so:
     `affect_neg! = nothing`) is still located, and the affect is skipped;
   - callbacks with a custom `initialize` or `finalize`, and callbacks combined with
     trajectories that have different time spans, throw an `ArgumentError`.
+
+# Initialization
+
+Each trajectory is initialized on the host, before the batch is stacked, as the CPU solve
+of that trajectory would be initialized:
+
+  - A problem with initialization data (such as a ModelingToolkit problem, including one
+    made with `remake(prob; ..., lazy_initialization = true)`) is initialized with
+    `OverrideInit`. The returned solution is built from the initialized problem, so its `u0`
+    and parameters, including parameters solved for during initialization, are the
+    initialized ones.
+  - The `initializealg` keyword of `solve` selects the algorithm: `OverrideInit` (whose
+    `nlsolve`, `abstol` and `reltol` are used), `CheckInit`, which checks the algebraic
+    equations of a mass-matrix problem, or `NoInit`. Other algorithms throw an
+    `ArgumentError`. The nonlinear solver defaults to `SimpleTrustRegion` (or
+    `SimpleGaussNewton` for a least-squares initialization problem), and the tolerances to
+    the `abstol` and `reltol` of the solve.
+  - A trajectory whose initialization fails is left out of the batch and returned with
+    `ReturnCode.InitialFailure`; its solution holds only the initial time and state. The
+    other trajectories are solved normally.
+
+The batched problem itself is solved without initialization.
 
 !!! warn
 
@@ -154,6 +186,11 @@ monteprob = EnsembleProblem(prob; prob_func, safetycopy = false)
 struct EnsembleGPUArray{Backend} <: EnsembleArrayAlgorithm
     backend::Backend
     cpu_offload::Float64
+    threaded_host::Bool
+end
+
+function EnsembleGPUArray(backend, cpu_offload; threaded_host::Bool = false)
+    return EnsembleGPUArray(backend, Float64(cpu_offload), threaded_host)
 end
 
 """
@@ -247,8 +284,8 @@ cpu_alg = Dict(
 
 # Work around the fact that Zygote cannot handle the task system
 # Work around the fact that Zygote isderiving fails with constants?
-function EnsembleGPUArray(dev)
-    return EnsembleGPUArray(dev, 0.2)
+function EnsembleGPUArray(dev; threaded_host::Bool = false)
+    return EnsembleGPUArray(dev, 0.2; threaded_host)
 end
 
 function EnsembleGPUKernel(dev)

@@ -64,6 +64,9 @@ run_qa(
                 # public cross-version replacement (Base.infer_return_type is 1.11+,
                 # and the LTS floor is Julia 1.10).
                 :Compiler, :return_type,
+                # NonlinearSolveBase accessor for the function an AutoSpecialize wrapper
+                # holds, used to solve initialization problems with SimpleNonlinearSolve.
+                :get_raw_f,
                 # CUDA batched LU used by DiffEqGPU.lufact!. CUDA's cuBLAS wrappers
                 # are not `public`, and there is no public batched-getrf spelling.
                 :getrf_strided_batched!,

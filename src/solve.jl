@@ -310,69 +310,102 @@ function batch_solve(
                 for i in eachindex(kernel_probs)
         ]
     else
-        if ensembleprob.safetycopy
-            probs = map(I) do i
-                ctx = _make_ensemble_context(i, sim_seeds, rng_func, master_rng)
-                ensembleprob.prob_func(deepcopy(ensembleprob.prob), ctx)
-            end
+        probs, initialized = _prepare_trajectories(
+            ensembleprob, ensemblealg, I, sim_seeds, rng_func, master_rng; kwargs...
+        )
+        # The host initialized the trajectories (or consumed the user's `initializealg`). The
+        # batched problem has no initialization data, and initializing it would run on the
+        # whole batch.
+        batch_kwargs = if _host_initialized(probs, get(kwargs, :initializealg, nothing))
+            (; kwargs..., initializealg = SciMLBase.NoInit())
         else
-            probs = map(I) do i
-                ctx = _make_ensemble_context(i, sim_seeds, rng_func, master_rng)
-                ensembleprob.prob_func(ensembleprob.prob, ctx)
-            end
+            kwargs
         end
-        u0 = _hcat_batch([Array(probs[i].u0) for i in 1:length(I)])
-
-        if !all(
-                Base.Fix2(
-                    (prob1, prob2) -> isequal(prob1.tspan, prob2.tspan),
-                    probs[1]
-                ),
-                probs
+        if all(initialized)
+            return _batch_solve_array(
+                ensembleprob, alg, ensemblealg, I, probs, adaptive;
+                sim_seeds, rng_func, master_rng, batch_kwargs...
             )
+        end
+        # Failed trajectories are left out of the batch, so they cannot hold up its steps.
+        failed = function (k)
+            return ensembleprob.output_func(
+                _initial_failure_solution(probs[k], alg),
+                _make_ensemble_context(I[k], sim_seeds, rng_func, master_rng)
+            )[1]
+        end
+        ok = findall(initialized)
+        isempty(ok) && return [failed(k) for k in eachindex(I)]
+        solved = _batch_solve_array(
+            ensembleprob, alg, ensemblealg, I[ok], probs[ok], adaptive;
+            sim_seeds, rng_func, master_rng, batch_kwargs...
+        )
+        sols = Vector{Any}(undef, length(I))
+        sols[ok] = solved
+        for k in findall(!, initialized)
+            sols[k] = failed(k)
+        end
+        identity.(sols)
+    end
+end
 
-            # Conditions and affects would see the normalized time and a `ParamWrapper` in
-            # place of the trajectory's parameters.
-            if has_ensemble_callbacks(probs[1]; kwargs...)
-                throw(
-                    ArgumentError(
-                        "Callbacks are not supported by EnsembleGPUArray when trajectories have different time spans. Give all trajectories the same `tspan`."
-                    )
+# Stack the trajectories of a batch, solve them as one problem and split the solution.
+function _batch_solve_array(
+        ensembleprob, alg, ensemblealg, I, probs, adaptive;
+        sim_seeds, rng_func, master_rng, kwargs...
+    )
+    u0 = _hcat_batch([Array(probs[i].u0) for i in 1:length(I)])
+
+    return if !all(
+            Base.Fix2(
+                (prob1, prob2) -> isequal(prob1.tspan, prob2.tspan),
+                probs[1]
+            ),
+            probs
+        )
+
+        # Conditions and affects would see the normalized time and a `ParamWrapper` in
+        # place of the trajectory's parameters.
+        if has_ensemble_callbacks(probs[1]; kwargs...)
+            throw(
+                ArgumentError(
+                    "Callbacks are not supported by EnsembleGPUArray when trajectories have different time spans. Give all trajectories the same `tspan`."
                 )
-            end
-
-            # Requires prob.p to be isbits otherwise it wouldn't work with ParamWrapper
-            @assert all(prob -> isbits(prob.p), probs)
-
-            # Remaking the problem to normalize time span values..."
-            p = _hcat_batch([ParamWrapper(probs[i].p, probs[i].tspan) for i in 1:length(I)])
-
-            # Change the tspan of first problem to (0,1)
-            orig_prob = probs[1]
-            probs[1] = remake(
-                probs[1];
-                tspan = (zero(probs[1].tspan[1]), one(probs[1].tspan[2]))
             )
+        end
 
-            sol,
-                solus = batch_solve_up(
-                ensembleprob, probs, alg, ensemblealg, I,
-                u0, p; adaptive, kwargs...
-            )
+        # Requires prob.p to be isbits otherwise it wouldn't work with ParamWrapper
+        @assert all(prob -> isbits(prob.p), probs)
 
-            probs[1] = orig_prob
+        # Remaking the problem to normalize time span values..."
+        p = _hcat_batch([ParamWrapper(probs[i].p, probs[i].tspan) for i in 1:length(I)])
 
-            [
-                ensembleprob.output_func(
+        # Change the tspan of first problem to (0,1)
+        orig_prob = probs[1]
+        probs[1] = remake(
+            probs[1];
+            tspan = (zero(probs[1].tspan[1]), one(probs[1].tspan[2]))
+        )
+
+        sol,
+            solus = batch_solve_up(
+            ensembleprob, probs, alg, ensemblealg, I,
+            u0, p; adaptive, kwargs...
+        )
+
+        probs[1] = orig_prob
+
+        [
+            ensembleprob.output_func(
                     SciMLBase.build_solution(
                         probs[i], alg,
                         map(
                             t -> probs[i].tspan[1] +
-                                (
+                            (
                                 probs[i].tspan[2] -
-                                    probs[i].tspan[1]
+                                probs[i].tspan[1]
                             ) *
-                                t,
+                            t,
                             sol.t
                         ), solus[i],
                         stats = sol.stats,
@@ -380,18 +413,18 @@ function batch_solve(
                     ),
                     _make_ensemble_context(I[i], sim_seeds, rng_func, master_rng)
                 )[1]
-                    for i in 1:length(probs)
-            ]
-        else
-            p = pack_ordinary_parameters(probs)
-            sol,
-                solus = batch_solve_up(
-                ensembleprob, probs, alg, ensemblealg, I, u0, p;
-                adaptive, kwargs...
-            )
-            final_p = final_batch_parameters(sol.prob.p)
-            [
-                ensembleprob.output_func(
+                for i in 1:length(probs)
+        ]
+    else
+        p = pack_ordinary_parameters(probs)
+        sol,
+            solus = batch_solve_up(
+            ensembleprob, probs, alg, ensemblealg, I, u0, p;
+            adaptive, kwargs...
+        )
+        final_p = final_batch_parameters(sol.prob.p)
+        [
+            ensembleprob.output_func(
                     SciMLBase.build_solution(
                         final_trajectory_problem(probs[i], final_p, i), alg, sol.t,
                         solus[i],
@@ -400,9 +433,8 @@ function batch_solve(
                     ),
                     _make_ensemble_context(I[i], sim_seeds, rng_func, master_rng)
                 )[1]
-                    for i in 1:length(probs)
-            ]
-        end
+                for i in 1:length(probs)
+        ]
     end
 end
 

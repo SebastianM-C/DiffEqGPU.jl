@@ -234,6 +234,7 @@ include("ensemblegpukernel/tableaus/kvaerno_tableaus.jl")
 
 include("utils.jl")
 include("algorithms.jl")
+include("ensemblegpuarray/initialization.jl")
 include("solve.jl")
 export EnsembleProblem, EnsembleSolution, EnsembleSerial, EnsembleThreads,
     EnsembleDistributed
