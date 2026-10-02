@@ -26,52 +26,47 @@ end
 end
 @inline ensemble_param(p::AbstractArray, i::Integer) = @inbounds p[i]
 
+# The right-hand side of trajectory `i`, written into the vector `du` from its state `u`: with
+# the trajectory's own parameters `ensemble_param(p, i)`, or, on the per-time-span path whose
+# parameters are `ParamWrapper`s, at its physical time and scaled to the normalized one. Every
+# kernel that evaluates a trajectory's right-hand side goes through this, so they agree.
 # The reparameterization is adapted from:https://github.com/rtqichen/torchdiffeq/issues/122#issuecomment-738978844
-# Map normalized time t∈[0,1] to each trajectory's physical tspan via a separate
-# local `t_phys`. Reassigning the kernel argument `t` leaks across CPU workgroup lanes.
-@kernel function gpu_kernel(
-        f, du, @Const(u),
-        @Const(params::AbstractArray{ParamWrapper{P, T}}),
-        @Const(t)
-    ) where {P, T}
-    i = @index(Global, Linear)
+@inline function trajectory_rhs!(f, iip::Val, du, u, p, i, t)
+    return _rhs!(f, iip, du, u, ensemble_param(p, i), t)
+end
+@inline function trajectory_rhs!(
+        f, iip::Val, du, u, params::AbstractArray{<:ParamWrapper}, i, t
+    )
     @inbounds p = params[i].params
     @inbounds tspan = params[i].data
-    # reparameterization t->(t_0, t_f) from t->(0, 1).
-    t_phys = (tspan[2] - tspan[1]) * t + tspan[1]
-    @views @inbounds f(du[:, i], u[:, i], p, t_phys)
-    @inbounds for j in 1:size(du, 1)
-        du[j, i] = du[j, i] * (tspan[2] - tspan[1])
+    # reparameterization t->(t_0, t_f) from t->(0, 1), in a separate local `t_phys`:
+    # reassigning the kernel argument `t` leaks across CPU workgroup lanes.
+    scale = tspan[2] - tspan[1]
+    t_phys = scale * t + tspan[1]
+    _rhs!(f, iip, du, u, p, t_phys)
+    @inbounds for j in eachindex(du)
+        du[j] = du[j] * scale
     end
+    return nothing
 end
 
-@kernel function gpu_kernel_oop(
-        f, du, @Const(u),
-        @Const(params::AbstractArray{ParamWrapper{P, T}}),
-        @Const(t)
-    ) where {P, T}
-    i = @index(Global, Linear)
-    @inbounds p = params[i].params
-    @inbounds tspan = params[i].data
-    # reparameterization
-    t_phys = (tspan[2] - tspan[1]) * t + tspan[1]
-    @views @inbounds x = f(u[:, i], p, t_phys)
-    @inbounds for j in 1:size(du, 1)
-        du[j, i] = x[j] * (tspan[2] - tspan[1])
+@inline _rhs!(f, ::Val{true}, du, u, p, t) = (f(du, u, p, t); nothing)
+@inline function _rhs!(f, ::Val{false}, du, u, p, t)
+    x = f(u, p, t)
+    @inbounds for j in eachindex(du)
+        du[j] = x[j]
     end
+    return nothing
 end
 
 @kernel function gpu_kernel(f, du, @Const(u), @Const(p), @Const(t))
     i = @index(Global, Linear)
-    @views @inbounds f(du[:, i], u[:, i], ensemble_param(p, i), t)
+    @views @inbounds trajectory_rhs!(f, Val(true), du[:, i], u[:, i], p, i, t)
 end
 
 @kernel function gpu_kernel_oop(f, du, @Const(u), @Const(p), @Const(t))
     i = @index(Global, Linear)
-    @views @inbounds x = f(u[:, i], ensemble_param(p, i), t)
-    @inbounds for j in 1:size(du, 1)
-        du[j, i] = x[j]
-    end
+    @views @inbounds trajectory_rhs!(f, Val(false), du[:, i], u[:, i], p, i, t)
 end
 
 @kernel function jac_kernel(
@@ -315,33 +310,43 @@ end
     end
 end
 
-# Finite differences of the batched right-hand side: state `j` of every trajectory is
-# perturbed at once. The step is relative to the state, and `h` keeps the increment actually
-# represented in floating point, so the quotients divide by the true difference.
-@kernel function fd_perturb_kernel(up, @Const(u), h, @Const(j), @Const(rel), @Const(plus))
-    i = @index(Global, Linear)
+# Finite differences of the batched right-hand side for columns `jlo, …, jlo + ncols - 1` of
+# every trajectory's Jacobian in one launch: thread `g` takes column `jlo + c - 1` of
+# trajectory `i`. It perturbs that state of its own copy of the trajectory's state (row `g` of
+# `up`), evaluates the trajectory's right-hand side into row `g` of `fp` (and, for central
+# differences, the backward perturbation into `fm`), and writes the difference quotients into
+# the Jacobian column. The copies are stored thread-fastest, so neighbouring threads touch
+# neighbouring addresses. The step is relative to the state, and the increment actually
+# represented in floating point is the one divided by.
+@kernel function fd_jacobian_kernel(
+        f, iip, W, up, fp, fm, @Const(u), @Const(f0), @Const(p), @Const(t), @Const(jlo),
+        @Const(ncols), @Const(rel), @Const(central)
+    )
+    g = @index(Global, Linear)
+    i = (g - 1) ÷ ncols + 1
+    j = jlo + (g - 1) % ncols
+    N = size(u, 1)
     @inbounds begin
-        uj = u[j, i]
-        if plus
-            up[j, i] = uj + rel * max(one(uj), abs(uj))
-            h[i] = up[j, i] - uj
-        else
-            up[j, i] = uj - h[i]
+        uc = view(up, g, :)
+        fpc = view(fp, g, :)
+        for k in 1:N
+            uc[k] = u[k, i]
         end
-    end
-end
-
-@kernel function fd_restore_kernel(up, @Const(u), @Const(j))
-    i = @index(Global, Linear)
-    @inbounds up[j, i] = u[j, i]
-end
-
-@kernel function fd_scatter_kernel(W, @Const(f1), @Const(f0), @Const(h), @Const(j), @Const(steps))
-    i = @index(Global, Linear)
-    @inbounds begin
-        d = steps * h[i]
-        for k in 1:size(f1, 1)
-            W[k, j, i] = (f1[k, i] - f0[k, i]) / d
+        uj = u[j, i]
+        uc[j] = uj + rel * max(one(uj), abs(uj))
+        h = uc[j] - uj
+        trajectory_rhs!(f, iip, fpc, uc, p, i, t)
+        if central
+            uc[j] = uj - h
+            fmc = view(fm, g, :)
+            trajectory_rhs!(f, iip, fmc, uc, p, i, t)
+            for k in 1:N
+                W[k, j, i] = (fpc[k] - fmc[k]) / (2 * h)
+            end
+        else
+            for k in 1:N
+                W[k, j, i] = (fpc[k] - f0[k, i]) / h
+            end
         end
     end
 end

@@ -148,49 +148,70 @@ function (J::ADBatchedJacobian)(W, u, p, t)
 end
 
 """
-    FDBatchedJacobian(f, u0; central = false)
+    FDBatchedJacobian(rhs, iip, batched_f, u0; central = false, kwargs...)
 
-Fills `W[:, :, i]` with trajectory `i`'s Jacobian by finite differences of the batched
-right-hand side `f(du, u, p, t)`, perturbing state `j` of every trajectory at once.
+Fills `W[:, :, i]` with trajectory `i`'s Jacobian by finite differences of its right-hand
+side `rhs` (in place when `iip` is `Val(true)`, out of place for `Val(false)`).
 
-It reuses the kernel of `f` as it is, so no kernel is compiled for the Jacobian, which
-matters for large right-hand sides whose dual-number kernel is too costly to compile. A
-Jacobian takes `N + 1` evaluations of `f` with forward differences and `2N` with central
-ones, which are more accurate: about `sqrt(eps)` and `eps^(2/3)` relative error.
+The perturbations of many columns of every trajectory's Jacobian are evaluated in one launch,
+one thread per column and trajectory, so a Jacobian takes a few launches rather than one per
+state; each launch then has enough threads to fill the device even for small batches. The
+kernel evaluates `rhs` per thread, as the batched right-hand side does, so no dual-number
+version of it is compiled, which matters for large right-hand sides. Forward differences
+also evaluate the unperturbed batched right-hand side `batched_f` once per Jacobian; central
+ones are more accurate (about `eps^(2/3)` relative error rather than `sqrt(eps)`) at twice
+the evaluations.
+
+Each launch covers `ncols` columns: enough that `ncols * ntraj` reaches `target_threads`
+threads, but no more than its per-thread copies of the state fit in `scratch_bytes`.
 """
-struct FDBatchedJacobian{F, U, H}
-    f::F
-    up::U
+struct FDBatchedJacobian{F, IIP, BF, U, S}
+    rhs::F
+    iip::IIP
+    batched_f::BF
     f0::U
-    f1::U
-    h::H
+    up::S
+    fp::S
+    fm::S
+    ncols::Int
     central::Bool
 end
 
-function FDBatchedJacobian(f, u0; central = false)
-    return FDBatchedJacobian(
-        f, similar(u0), similar(u0), similar(u0), similar(u0, eltype(u0), size(u0, 2)),
-        central
+# Threads per launch that saturate current GPUs with a heavy right-hand side, and the memory
+# the per-thread copies of the state may take.
+const FD_TARGET_THREADS = 1 << 17
+const FD_SCRATCH_BYTES = 1 << 29
+
+function FDBatchedJacobian(
+        rhs, iip, batched_f, u0; central = false,
+        target_threads = FD_TARGET_THREADS, scratch_bytes = FD_SCRATCH_BYTES
     )
+    N, ntraj = size(u0)
+    # The perturbed state and its right-hand side, and the backward one for central ones.
+    copies = central ? 3 : 2
+    by_threads = cld(target_threads, ntraj)
+    by_memory = scratch_bytes ÷ (copies * N * ntraj * sizeof(eltype(u0)))
+    ncols = clamp(min(by_threads, by_memory), 1, N)
+    up = similar(u0, ncols * ntraj, N)
+    fp = similar(u0, ncols * ntraj, N)
+    fm = central ? similar(u0, ncols * ntraj, N) : similar(u0, 0, N)
+    f0 = similar(u0, central ? (N, 0) : (N, ntraj))
+    return FDBatchedJacobian(rhs, iip, batched_f, f0, up, fp, fm, ncols, central)
 end
 
 function (J::FDBatchedJacobian)(W, u, p, t)
     version = get_backend(u)
-    wgs = workgroupsize(version, size(u, 2))
-    launch = (; ndrange = size(u, 2), workgroupsize = wgs)
+    N, ntraj = size(u)
     T = real(eltype(u))
     rel = J.central ? cbrt(eps(T)) : sqrt(eps(T))
-    copyto!(J.up, u)
-    J.central || J.f(J.f0, u, p, t)
-    for j in 1:size(u, 1)
-        fd_perturb_kernel(version)(J.up, u, J.h, j, rel, true; launch...)
-        J.f(J.f1, J.up, p, t)
-        if J.central
-            fd_perturb_kernel(version)(J.up, u, J.h, j, rel, false; launch...)
-            J.f(J.f0, J.up, p, t)
-        end
-        fd_scatter_kernel(version)(W, J.f1, J.f0, J.h, j, J.central ? 2 : 1; launch...)
-        fd_restore_kernel(version)(J.up, u, j; launch...)
+    J.central || J.batched_f(J.f0, u, p, t)
+    for jlo in 1:J.ncols:N
+        ncols = min(J.ncols, N - jlo + 1)
+        n = ncols * ntraj
+        fd_jacobian_kernel(version)(
+            J.rhs, J.iip, W, J.up, J.fp, J.fm, u, J.f0, p, t, jlo, ncols, rel, J.central;
+            ndrange = n, workgroupsize = workgroupsize(version, n)
+        )
     end
     return nothing
 end
@@ -198,14 +219,16 @@ end
 _ad_chunksize(::ADTypes.AutoForwardDiff{C}) where {C} = C
 
 """
-    batched_jacobian(f, u0, alg)
+    batched_jacobian(f, u0, alg; rhs, iip)
 
 The filler of the per-trajectory Jacobians for a stiff solve of a problem without `jac`,
 as the algorithm's `autodiff` asks: `AutoForwardDiff` (whose `chunksize` sets the dual
 chunk, `ForwardDiff.pickchunksize(N, 8)` by default) or `AutoFiniteDiff` (`:forward` or
 `:central` differences). Other automatic differentiation backends throw an `ArgumentError`.
+`f` is the batched right-hand side; finite differences also evaluate the per-trajectory
+right-hand side `rhs`, which is in place when `iip`.
 """
-function batched_jacobian(f, u0, alg)
+function batched_jacobian(f, u0, alg; rhs = nothing, iip = true)
     ad = hasproperty(alg, :autodiff) ? alg.autodiff : ADTypes.AutoForwardDiff()
     ad isa ADTypes.AutoSparse && (ad = ADTypes.dense_ad(ad))
     if ad isa ADTypes.AutoForwardDiff
@@ -219,7 +242,7 @@ function batched_jacobian(f, u0, alg)
                 "`EnsembleGPUArray` computes the Jacobian with forward or central finite differences; got `fdjtype = $fdtype`."
             )
         )
-        return FDBatchedJacobian(f, u0; central = fdtype isa Val{:central})
+        return FDBatchedJacobian(rhs, Val(iip), f, u0; central = fdtype isa Val{:central})
     end
     throw(
         ArgumentError(
@@ -308,7 +331,12 @@ function generate_problem(
     _Wfact!_t = if SciMLBase.has_jac(prob.f)
         batched_Wfact_t(prob.f.jac, DiffEqBase.isinplace(prob), mass_diag, ipiv)
     elseif jac_prototype !== nothing
-        batched_Wfact_t(batched_jacobian(_f, u0, alg), mass_diag, ipiv)
+        batched_Wfact_t(
+            batched_jacobian(
+                _f, u0, alg; rhs = prob.f.f, iip = DiffEqBase.isinplace(prob)
+            ),
+            mass_diag, ipiv
+        )
     else
         nothing
     end

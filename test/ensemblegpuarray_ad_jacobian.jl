@@ -77,27 +77,76 @@ end
     end
 end
 
+function l96!(du, u, p, t)
+    N = length(u)
+    for k in 1:N
+        du[k] = (u[mod1(k + 1, N)] - u[mod1(k - 2, N)]) * u[mod1(k - 1, N)] - u[k] + p[1]
+    end
+    return nothing
+end
+
+function batched_rhs(f, iip)
+    kernel = iip ? DiffEqGPU.gpu_kernel : DiffEqGPU.gpu_kernel_oop
+    return (du, u, p, t) -> kernel(backend)(
+        f, du, u, p, t; ndrange = size(u, 2), workgroupsize = size(u, 2)
+    )
+end
+
+# `params(i)` are trajectory `i`'s parameters as the reference sees them, and `scale(i)` the
+# factor the batched right-hand side applies to its derivative.
+function check_fd_jacobian(f, iip, N, u, p, params, scale; central, kwargs...)
+    ntraj = size(u, 2)
+    rtol = central ? 1.0e-8 : 1.0e-5
+    ud = adapt(backend, u)
+    J = DiffEqGPU.FDBatchedJacobian(f, Val(iip), batched_rhs(f, iip), ud; central, kwargs...)
+    W = adapt(backend, zeros(N, N, ntraj))
+    J(W, ud, adapt(backend, p), 0.0)
+    Wh = Array(W)
+    for i in 1:ntraj
+        Jref = if iip
+            ForwardDiff.jacobian((du, x) -> f(du, x, params(i), 0.0), zeros(N), u[:, i])
+        else
+            ForwardDiff.jacobian(x -> f(x, params(i), 0.0), u[:, i])
+        end
+        @test isapprox(Wh[:, :, i], scale(i) * Jref; rtol)
+    end
+    # The state is left as it was.
+    @test Array(ud) == u
+    return J
+end
+
 @testset "Batched finite-difference Jacobian" begin
     N, ntraj = 2, 5
     u = rand(N, ntraj) .+ 0.5
     p = reshape(collect(10.0:10.0:50.0), 1, :)
-    for f! in (vdp!, tabulated!), (central, rtol) in ((false, 1.0e-5), (true, 1.0e-8))
-        batched_f = (du, u, p, t) -> DiffEqGPU.gpu_kernel(backend)(
-            f!, du, u, p, t; ndrange = size(u, 2), workgroupsize = size(u, 2)
-        )
-        ud = adapt(backend, u)
-        J = DiffEqGPU.FDBatchedJacobian(batched_f, ud; central)
-        W = adapt(backend, zeros(N, N, ntraj))
-        J(W, ud, adapt(backend, p), 0.0)
-        Wh = Array(W)
-        for i in 1:ntraj
-            Jref = ForwardDiff.jacobian(
-                (du, x) -> f!(du, x, p[:, i], 0.0), zeros(N), u[:, i]
-            )
-            @test isapprox(Wh[:, :, i], Jref; rtol)
+    for central in (false, true)
+        for f! in (vdp!, tabulated!)
+            check_fd_jacobian(f!, true, N, u, p, i -> p[:, i], i -> 1; central)
         end
-        # The state is left as it was.
-        @test Array(ud) == u
+        # Out-of-place right-hand side.
+        check_fd_jacobian(vdp, false, N, u, p, i -> p[:, i], i -> 1; central)
+        # Per-trajectory time spans: the right-hand side is scaled by the span's length.
+        tspans = [(0.0, 1.0 + i) for i in 1:ntraj]
+        pw = [DiffEqGPU.ParamWrapper((p[1, i],), tspans[i]) for i in 1:ntraj]
+        check_fd_jacobian(
+            vdp!, true, N, u, pw, i -> (p[1, i],), i -> tspans[i][2] - tspans[i][1]; central
+        )
+    end
+end
+
+@testset "Finite-difference Jacobian in several launches" begin
+    N, ntraj = 5, 3
+    u = rand(N, ntraj) .+ 0.5
+    p = reshape([8.0, 9.0, 10.0], 1, :)
+    for central in (false, true)
+        # The memory budget allows one column per launch, the thread target two, and by
+        # default all of them fit in one launch.
+        for (kwargs, ncols) in (
+                ((; scratch_bytes = 1), 1), ((; target_threads = 2 * ntraj), 2), ((;), N),
+            )
+            J = check_fd_jacobian(l96!, true, N, u, p, i -> p[:, i], i -> 1; central, kwargs...)
+            @test J.ncols == ncols
+        end
     end
 end
 
