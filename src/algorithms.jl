@@ -106,6 +106,16 @@ This introduces the following limitations on its usage:
   - To use multiple GPUs over clusters, one must manually set up one process per GPU. See
     the multi-GPU tutorial for more details.
 
+# Failures
+
+All trajectories share one integrator, so the solve of a batch stops when any trajectory
+fails, for example when its step size collapses. The trajectory that made the shared step
+fail (the one with the largest error, or with a non-finite state) is returned with the
+batch's return code, such as `ReturnCode.Unstable`; the other trajectories are returned with
+`ReturnCode.Failure`, with solutions that are valid up to the time the batch stopped. With a
+user `internalnorm`, which replaces the per-trajectory norm that identifies the failing
+trajectory, every trajectory is returned with the batch's return code.
+
 # Callbacks
 
 Callbacks can be given on the problem or as the `callback` keyword of `solve`. As in

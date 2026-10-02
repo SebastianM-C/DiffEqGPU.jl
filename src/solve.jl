@@ -393,8 +393,7 @@ function _batch_solve_array(
             tspan = (zero(probs[1].tspan[1]), one(probs[1].tspan[2]))
         )
 
-        sol,
-            solus = batch_solve_up(
+        sol, solus, retcodes = batch_solve_up(
             ensembleprob, probs, alg, ensemblealg, I,
             u0, p; adaptive, kwargs...
         )
@@ -415,7 +414,7 @@ function _batch_solve_array(
                             sol.t
                         ), solus[i],
                         stats = sol.stats,
-                        retcode = sol.retcode
+                        retcode = retcodes[i]
                     ),
                     _make_ensemble_context(I[i], sim_seeds, rng_func, master_rng)
                 )[1]
@@ -423,8 +422,7 @@ function _batch_solve_array(
         ]
     else
         p = pack_parameters(probs, float(eltype(u0)))
-        sol,
-            solus = batch_solve_up(
+        sol, solus, retcodes = batch_solve_up(
             ensembleprob, probs, alg, ensemblealg, I, u0, p;
             adaptive, kwargs...
         )
@@ -435,7 +433,7 @@ function _batch_solve_array(
                         with_parameters(probs[i], ps[i]), alg, sol.t,
                         solus[i],
                         stats = sol.stats,
-                        retcode = sol.retcode
+                        retcode = retcodes[i]
                     ),
                     _make_ensemble_context(I[i], sim_seeds, rng_func, master_rng)
                 )[1]
@@ -512,15 +510,17 @@ function batch_solve_up(ensembleprob, probs, alg, ensemblealg, I, u0, p; kwargs.
         _alg = alg
     end
 
+    norm = TrajectoryNorm(len)
     sol = solve(
-        prob, _alg; internalnorm = TrajectoryNorm(len),
+        prob, _alg; internalnorm = norm,
         batched_initializealg(prob, kwargs)..., kwargs...,
         callback = _callback, merge_callbacks = false
     )
 
     us = Array.(sol.u)
     solus = [[@view(us[i][:, j]) for i in 1:length(us)] for j in 1:length(probs)]
-    return (sol, solus)
+    # A `internalnorm` keyword replaces `norm`, which then finds no culprit.
+    return (sol, solus, trajectory_retcodes(sol, norm, length(probs)))
 end
 
 function seed_duals(
@@ -654,7 +654,7 @@ function ChainRulesCore.rrule(
         end
         return (ntuple(_ -> NoTangent(), 7)..., _batch_param_cotangent(p, adj))
     end
-    return (sol, solus), batch_solve_up_adjoint
+    return (sol, solus, fill(sol.retcode, length(probs))), batch_solve_up_adjoint
 end
 
 function solve_batch(

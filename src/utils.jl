@@ -12,10 +12,21 @@ diffeqgpunorm(u::ForwardDiff.Dual, t) = abs(ForwardDiff.value(u))
 # trajectory needs.
 struct TrajectoryNorm
     len::Int
+    # The trajectory with the largest error in the last norm of a state-shaped array: when the
+    # shared step fails, the trajectory that made it fail.
+    worst::Base.RefValue{Int}
 end
+TrajectoryNorm(len::Integer) = TrajectoryNorm(len, Ref(0))
 
 # OrdinaryDiffEq broadcasts the norm over residual arrays; treat it as a scalar like a function.
+# OrdinaryDiffEq broadcasts the norm over residual arrays; treat it as a scalar like a function.
 Base.broadcastable(n::TrajectoryNorm) = Ref(n)
+
+# Elementwise broadcasts only call the scalar methods, which need nothing of the norm, so a
+# device broadcast gets an isbits stand-in instead of the norm and its `worst` reference.
+struct ScalarTrajectoryNorm end
+(::ScalarTrajectoryNorm)(u, t) = abs(_norm_value(u))
+Adapt.adapt_structure(to, ::TrajectoryNorm) = ScalarTrajectoryNorm()
 
 _norm_value(x) = x
 _norm_value(x::ForwardDiff.Dual) = ForwardDiff.value(x)
@@ -27,8 +38,30 @@ function (n::TrajectoryNorm)(u::AbstractArray, t)
     # An array not made of whole trajectories (no state-shaped solver array is) falls back
     # to the RMS over all entries.
     length(u) % n.len == 0 || return diffeqgpunorm(u, t)
-    sq = sum(abs2 ∘ _norm_value, reshape(u, n.len, :); dims = 1)
-    return sqrt(maximum(sq) / n.len)
+    sq = vec(sum(abs2 ∘ _norm_value, reshape(u, n.len, :); dims = 1))
+    # `findmax` treats `NaN` as the largest value, so a trajectory gone non-finite is the worst.
+    largest, n.worst[] = findmax(sq)
+    return sqrt(largest / n.len)
+end
+
+# One return code per trajectory. A failed batch stops all of its trajectories at once, but only
+# the trajectory whose error made the shared step fail, or whose state is not finite, failed
+# itself: it gets the batch's return code, and the others `ReturnCode.Failure`, as their
+# solutions are valid but end early. Without a culprit (e.g. with a user `internalnorm`), every
+# trajectory gets the batch's return code.
+function trajectory_retcodes(sol, norm, ntraj)
+    retcode = sol.retcode
+    SciMLBase.successful_retcode(retcode) && return fill(retcode, ntraj)
+    culprits = falses(ntraj)
+    norm isa TrajectoryNorm && norm.worst[] in 1:ntraj && (culprits[norm.worst[]] = true)
+    if !isempty(sol.u)
+        last_state = Array(sol.u[end])
+        for j in 1:ntraj
+            all(isfinite ∘ _norm_value, view(last_state, :, j)) || (culprits[j] = true)
+        end
+    end
+    any(culprits) || return fill(retcode, ntraj)
+    return [culprits[j] ? retcode : SciMLBase.ReturnCode.Failure for j in 1:ntraj]
 end
 
 """

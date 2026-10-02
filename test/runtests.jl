@@ -121,6 +121,9 @@ if GROUP in SUPPORTS_DOUBLE_PRECISION
     @time @safetestset "EnsembleGPUArray per-trajectory error norm" begin
         include("ensemblegpuarray_trajectory_norm.jl")
     end
+    @time @safetestset "EnsembleGPUArray failure return codes" begin
+        include("ensemblegpuarray_failure_retcodes.jl")
+    end
     @time @safetestset "EnsembleGPUArray callbacks" begin
         include("ensemblegpuarray_callbacks.jl")
     end
@@ -174,6 +177,9 @@ if GROUP == "CPU"
     end
     @time @safetestset "EnsembleGPUArray per-trajectory error norm" begin
         include("ensemblegpuarray_trajectory_norm.jl")
+    end
+    @time @safetestset "EnsembleGPUArray failure return codes" begin
+        include("ensemblegpuarray_failure_retcodes.jl")
     end
     @time @safetestset "EnsembleGPUArray pivoted LU" begin
         include("ensemblegpuarray_pivoting.jl")
