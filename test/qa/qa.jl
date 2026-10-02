@@ -89,6 +89,9 @@ run_qa(
                 # DiffEqGPU's batched-callback hooks that the DiffEqCallbacks and
                 # ModelingToolkitBase extensions add methods to or call.
                 :batched_affect, :batched_time_callback, :check_device_affect,
+                # DiffEqGPU's opt-out hook for the cooperative batched `ldiv!`, which the
+                # JLArrays extension turns off.
+                :cooperative_ldiv,
                 # DiffEqGPU's ModelingToolkit hooks and internal problem types that the
                 # ModelingToolkitBase extension implements or builds.
                 :ImmutableSCCBlock, :ImmutableSCCNonlinearProblem, :final_parameters,
