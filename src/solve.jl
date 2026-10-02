@@ -24,6 +24,8 @@ function SciMLBase.__solve(
         )
     end
 
+    ensemblealg isa EnsembleArrayAlgorithm && check_array_algorithm(ensembleprob.prob, alg)
+
     # Pre-generate per-trajectory seeds for reproducibility (matching SciMLBase v3 protocol)
     sim_seeds = (rng !== nothing || seed !== nothing) ?
         SciMLBase.generate_sim_seeds(rng, seed, trajectories) : nothing
@@ -454,10 +456,10 @@ function batch_solve_up(ensembleprob, probs, alg, ensemblealg, I, u0, p; kwargs.
     if SciMLBase.has_jac(probs[1].f)
         if ensemblealg isa EnsembleGPUArray
             backend = ensemblealg.backend
-            jac_prototype = allocate(backend, Float32, (len, len, length(I)))
-            fill!(jac_prototype, 0.0)
+            jac_prototype = allocate(backend, eltype(u0), (len, len, length(I)))
+            fill!(jac_prototype, false)
         else
-            jac_prototype = zeros(Float32, len, len, length(I))
+            jac_prototype = zeros(eltype(u0), len, len, length(I))
         end
 
         if probs[1].f.colorvec !== nothing
@@ -481,7 +483,8 @@ function batch_solve_up(ensembleprob, probs, alg, ensemblealg, I, u0, p; kwargs.
     end
 
     sol = solve(
-        prob, _alg; internalnorm = TrajectoryNorm(len), kwargs...,
+        prob, _alg; internalnorm = TrajectoryNorm(len),
+        batched_initializealg(prob, kwargs)..., kwargs...,
         callback = _callback, merge_callbacks = false
     )
 
@@ -559,10 +562,10 @@ function ChainRulesCore.rrule(
     if SciMLBase.has_jac(probs[1].f)
         if ensemblealg isa EnsembleGPUArray
             backend = ensemblealg.backend
-            jac_prototype = allocate(backend, Float32, (len, len, length(I)))
-            fill!(jac_prototype, 0.0)
+            jac_prototype = allocate(backend, eltype(u0), (len, len, length(I)))
+            fill!(jac_prototype, false)
         else
-            jac_prototype = zeros(Float32, len, len, length(I))
+            jac_prototype = zeros(eltype(u0), len, len, length(I))
         end
         if probs[1].f.colorvec !== nothing
             colorvec = repeat(probs[1].f.colorvec, length(I))
@@ -585,7 +588,8 @@ function ChainRulesCore.rrule(
     end
 
     sol = solve(
-        prob, _alg; internalnorm = TrajectoryNorm(len), kwargs...,
+        prob, _alg; internalnorm = TrajectoryNorm(len),
+        batched_initializealg(prob, kwargs)..., kwargs...,
         callback = _callback, merge_callbacks = false
     )
 

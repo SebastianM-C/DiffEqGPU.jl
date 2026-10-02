@@ -14,8 +14,8 @@ using SciMLBase: SciMLBase, CallbackSet, CheckInit, ContinuousCallback,
     ODEProblem, ReturnCode, SDEFunction, SDEProblem,
     VectorContinuousCallback, remake, terminate!
 using DiffEqBase: DiffEqBase, BrownFullBasicInit
-using LinearAlgebra: LinearAlgebra, I, LowerTriangular, NoPivot, RowMaximum,
-    SingularException, UpperTriangular, det
+using LinearAlgebra: LinearAlgebra, Diagonal, I, LowerTriangular, NoPivot, RowMaximum,
+    SingularException, UniformScaling, UpperTriangular, det, diag, isdiag
 using Distributed: Distributed, nprocs, pmap
 using ForwardDiff: ForwardDiff
 import ChainRulesCore

@@ -227,155 +227,70 @@ function workgroupsize(backend, n)
     return min(maxthreads(backend), n)
 end
 
-@kernel function W_kernel(
-        jac, W, @Const(u),
-        @Const(params::AbstractArray{ParamWrapper{P, T}}), @Const(gamma),
-        @Const(t)
-    ) where {P, T}
-    i = @index(Global, Linear)
-    len = size(u, 1)
-    _W = @inbounds @view(W[:, :, i])
+# `Wfact_t` for the batched problem is assembled in two passes: one kernel writes each
+# trajectory's Jacobian into its slice `W[:, :, i]`, and a second subtracts the mass matrix,
+# giving OrdinaryDiffEq's `W = J - M / γ`. Keeping the passes apart lets the Jacobian come
+# from another source without touching the mass-matrix handling.
 
-    @inbounds p = params[i].params
-    @inbounds tspan = params[i].data
-
-    # reparameterization
-    t_phys = (tspan[2] - tspan[1]) * t + tspan[1]
-
-    @views @inbounds jac(_W, u[:, i], p, t_phys)
-
-    @inbounds for i in eachindex(_W)
-        _W[i] = gamma * _W[i] * (tspan[2] - tspan[1])
-    end
-    _one = one(eltype(_W))
-    @inbounds for i in 1:len
-        _W[i, i] = _W[i, i] - _one
-    end
-end
-
-@kernel function W_kernel(jac, W, @Const(u), @Const(p), @Const(gamma), @Const(t))
-    i = @index(Global, Linear)
-    len = size(u, 1)
-    _W = @inbounds @view(W[:, :, i])
-    @views @inbounds jac(_W, u[:, i], ensemble_param(p, i), t)
-    @inbounds for i in eachindex(_W)
-        _W[i] = gamma * _W[i]
-    end
-    _one = one(eltype(_W))
-    @inbounds for i in 1:len
-        _W[i, i] = _W[i, i] - _one
-    end
-end
-
-@kernel function W_kernel_oop(
+# With per-trajectory time spans the solver integrates in normalized time `t ∈ [0, 1]`, and
+# the right-hand side is scaled by `tf - t0`, so its Jacobian is scaled by the same factor.
+@kernel function batched_jac_kernel(
         jac, W, @Const(u),
         @Const(params::AbstractArray{ParamWrapper{P, T}}),
-        @Const(gamma),
         @Const(t)
     ) where {P, T}
     i = @index(Global, Linear)
-    len = size(u, 1)
-
+    _W = @inbounds @view(W[:, :, i])
     @inbounds p = params[i].params
     @inbounds tspan = params[i].data
-
-    _W = @inbounds @view(W[:, :, i])
-
-    # reparameterization
     t_phys = (tspan[2] - tspan[1]) * t + tspan[1]
-
-    @views @inbounds x = jac(u[:, i], p, t_phys)
-    @inbounds for j in 1:length(_W)
-        _W[j] = x[j] * (tspan[2] - tspan[1])
-    end
-    @inbounds for i in eachindex(_W)
-        _W[i] = gamma * _W[i]
-    end
-    _one = one(eltype(_W))
-    @inbounds for i in 1:len
-        _W[i, i] = _W[i, i] - _one
-    end
-end
-
-@kernel function W_kernel_oop(jac, W, @Const(u), @Const(p), @Const(gamma), @Const(t))
-    i = @index(Global, Linear)
-    len = size(u, 1)
-    _W = @inbounds @view(W[:, :, i])
-    @views @inbounds x = jac(u[:, i], ensemble_param(p, i), t)
-    @inbounds for j in 1:length(_W)
-        _W[j] = x[j]
-    end
-    @inbounds for i in eachindex(_W)
-        _W[i] = gamma * _W[i]
-    end
-    _one = one(eltype(_W))
-    @inbounds for i in 1:len
-        _W[i, i] = _W[i, i] - _one
-    end
-end
-
-@kernel function Wt_kernel(
-        jac, W, @Const(u), @Const(params::AbstractArray{ParamWrapper{P, T}}),
-        @Const(gamma), @Const(t)
-    ) where {P, T}
-    i = @index(Global, Linear)
-    len = size(u, 1)
-    @inbounds p = params[i].params
-    @inbounds tspan = params[i].data
-
-    # reparameterization
-    t_phys = (tspan[2] - tspan[1]) * t + tspan[1]
-
-    _W = @inbounds @view(W[:, :, i])
     @views @inbounds jac(_W, u[:, i], p, t_phys)
-    @inbounds for i in 1:len
-        _W[i, i] = -inv(gamma) + _W[i, i] * (tspan[2] - tspan[1])
+    @inbounds for j in eachindex(_W)
+        _W[j] = _W[j] * (tspan[2] - tspan[1])
     end
 end
 
-@kernel function Wt_kernel_oop(
-        jac, W, @Const(u), @Const(params::AbstractArray{ParamWrapper{P, T}}),
-        @Const(gamma), @Const(t)
-    ) where {P, T}
+@kernel function batched_jac_kernel(jac, W, @Const(u), @Const(p), @Const(t))
     i = @index(Global, Linear)
-    len = size(u, 1)
-
-    @inbounds p = params[i].params
-    @inbounds tspan = params[i].data
-
-    # reparameterization
-    t_phys = (tspan[2] - tspan[1]) * t + tspan[1]
-
-    _W = @inbounds @view(W[:, :, i])
-    @views @inbounds x = jac(u[:, i], p, t_phys)
-    @inbounds for j in 1:length(_W)
-        _W[j] = x[j] * (tspan[2] - tspan[1])
-    end
-    @inbounds for i in 1:len
-        _W[i, i] = -inv(gamma) + _W[i, i]
-    end
-end
-
-@kernel function Wt_kernel(jac, W, @Const(u), @Const(p), @Const(gamma), @Const(t))
-    i = @index(Global, Linear)
-    len = size(u, 1)
     _W = @inbounds @view(W[:, :, i])
     @views @inbounds jac(_W, u[:, i], ensemble_param(p, i), t)
-    @inbounds for i in 1:len
-        _W[i, i] = -inv(gamma) + _W[i, i]
+end
+
+@kernel function batched_jac_kernel_oop(
+        jac, W, @Const(u),
+        @Const(params::AbstractArray{ParamWrapper{P, T}}),
+        @Const(t)
+    ) where {P, T}
+    i = @index(Global, Linear)
+    _W = @inbounds @view(W[:, :, i])
+    @inbounds p = params[i].params
+    @inbounds tspan = params[i].data
+    t_phys = (tspan[2] - tspan[1]) * t + tspan[1]
+    @views @inbounds x = jac(u[:, i], p, t_phys)
+    @inbounds for j in eachindex(_W)
+        _W[j] = x[j] * (tspan[2] - tspan[1])
     end
 end
 
-@kernel function Wt_kernel_oop(jac, W, @Const(u), @Const(p), @Const(gamma), @Const(t))
+@kernel function batched_jac_kernel_oop(jac, W, @Const(u), @Const(p), @Const(t))
     i = @index(Global, Linear)
-    len = size(u, 1)
     _W = @inbounds @view(W[:, :, i])
     @views @inbounds x = jac(u[:, i], ensemble_param(p, i), t)
-    @inbounds for j in 1:length(_W)
+    @inbounds for j in eachindex(_W)
         _W[j] = x[j]
     end
-    @inbounds for i in 1:len
-        _W[i, i] = -inv(gamma) + _W[i, i]
+end
+
+# `mass_diag` is the diagonal of the mass matrix shared by every trajectory, or `nothing` for
+# the identity.
+@inline _mass_diagonal(::Nothing, j, W) = one(eltype(W))
+@inline _mass_diagonal(mass_diag, j, W) = @inbounds mass_diag[j]
+
+@kernel function subtract_mass_kernel(W, @Const(mass_diag), @Const(gamma))
+    i = @index(Global, Linear)
+    invgamma = inv(gamma)
+    @inbounds for j in 1:size(W, 1)
+        W[j, j, i] = W[j, j, i] - _mass_diagonal(mass_diag, j, W) * invgamma
     end
 end
 
