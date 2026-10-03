@@ -45,7 +45,7 @@ function lane_retcode(status)
     status == LANE_UNSTABLE && return ReturnCode.Unstable
     status == LANE_DTMIN && return ReturnCode.DtLessThanMin
     status == LANE_MAXITERS && return ReturnCode.MaxIters
-    status == LANE_PIVOT && return ReturnCode.Unstable
+    status == LANE_PIVOT && return ReturnCode.InternalLinearSolveFailed
     return ReturnCode.Failure
 end
 

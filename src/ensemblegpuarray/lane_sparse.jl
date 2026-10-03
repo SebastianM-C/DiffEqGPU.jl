@@ -64,7 +64,8 @@ The status of a lane after its iteration matrix W has been factorized with the f
 order, from `σ = min_k |U[k, k]| / |W[k, k]|`: how much the pivots shrank during the
 elimination (`σ = 1` when no pivot lost magnitude; scale-invariant, unlike a ratio to the
 column maximum or the size of the multipliers). Returns `LANE_ACTIVE` to continue with the
-factors, or a final status (`LANE_PIVOT`) to stop the lane. A NaN pivot makes `σ` NaN
+factors, or a final status (`LANE_PIVOT`, reported as `ReturnCode.InternalLinearSolveFailed`)
+to stop the lane. A NaN pivot makes `σ` NaN
 (compare with `!(σ >= threshold)` to treat it as failing); an exactly zero or non-finite
 pivot also makes the step's error estimate non-finite, which the controller turns into
 `LANE_UNSTABLE`. `σ` measures the cancellation during the elimination only: a pivot that is

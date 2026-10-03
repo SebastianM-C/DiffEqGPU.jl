@@ -319,7 +319,7 @@ end
         @test only(pmin) ≈ min(1.0, abs(w22 - 1) / w22) rtol = 1.0e-3
     end
     @test DiffEqGPU.lane_pivot_status(NaN) == DiffEqGPU.LANE_PIVOT
-    @test DiffEqGPU.lane_retcode(DiffEqGPU.LANE_PIVOT) == SciMLBase.ReturnCode.Unstable
+    @test DiffEqGPU.lane_retcode(DiffEqGPU.LANE_PIVOT) == SciMLBase.ReturnCode.InternalLinearSolveFailed
     # A matching uses a pattern entry that is zero in the values only where no zero-free one
     # exists.
     A = zeros(5, 5)
