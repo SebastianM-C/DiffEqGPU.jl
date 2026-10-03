@@ -426,7 +426,7 @@ end
 @kernel function lane_controller_kernel(
         t, dt, dtprop, tprev, hprev, errold, status, fresh, clamped, naccept, nreject,
         stop_idx, landed, save_idx, save_hi, save_at, @Const(EEst), @Const(stops), @Const(savet),
-        @Const(ctrl), @Const(dtmin), @Const(dtmax), @Const(maxiters)
+        @Const(ctrl), @Const(dtmax), @Const(maxiters)
     )
     i = @index(Global, Linear)
     @inbounds if status[i] == LANE_ACTIVE
@@ -480,8 +480,10 @@ end
                 fresh[i] = false
             end
             if status[i] == LANE_ACTIVE
-                dtnew = min(dtnew, dtmax)
-                if dtnew <= dtmin
+                # As OrdinaryDiffEq (default `dtmin = 0`): proposals are bounded below by
+                # `eps(t)`, and a lane fails only when a step that small is rejected.
+                dtnew = max(min(dtnew, dtmax), eps(t[i]))
+                if !accept && h <= eps(ti)
                     status[i] = LANE_DTMIN
                 elseif naccept[i] + nreject[i] >= maxiters
                     status[i] = LANE_MAXITERS
@@ -1130,7 +1132,7 @@ function lane_step!(st, iip, wgs)
     lane_controller_kernel(backend)(
         st.t, st.dt, st.dtprop, st.tprev, st.hprev, st.errold, st.status, st.fresh,
         st.clamped, st.naccept, st.nreject, st.stop_idx, st.landed, st.save_idx, st.save_hi,
-        st.save_at, st.EEst, st.stops, st.savet, st.ctrl, st.dtmin, st.dtmax, st.maxiters;
+        st.save_at, st.EEst, st.stops, st.savet, st.ctrl, st.dtmax, st.maxiters;
         ndrange = B, workgroupsize = wgs
     )
 
