@@ -280,6 +280,23 @@ end
         xc, scratch_c, Wc, status, lu, 1; ndrange = (4, 2), workgroupsize = (4, 2)
     )
     @test vec(xc) ≈ W \ b rtol = 1.0e-12
+    # The pivot check: with the order fixed to the identity, W = [1 1; 1 1 + 1e-12] keeps only
+    # 1e-12 of its second pivot (σ = 1e-12), so the lane stops; a well-conditioned W does not.
+    Pg = sparse(trues(2, 2))
+    Pgb = DiffEqGPU._lane_sparsity_pattern(Pg, 2)
+    lug = DiffEqGPU._lane_sparse_lu(Matrix(Pgb), Pgb, [1, 2], [1, 2])
+    for (w22, expected) in ((1 + 1.0e-12, DiffEqGPU.LANE_PIVOT), (3.0, DiffEqGPU.LANE_ACTIVE))
+        st = [DiffEqGPU.LANE_ACTIVE]
+        pmin = [1.0]
+        DiffEqGPU.lane_sparse_factor_kernel(cpu)(
+            zeros(1, lug.nslot), zeros(1, 2), pmin, st, [1.0 1.0 1.0 w22], zeros(2), [1.0], 1.0, lug;
+            ndrange = 1
+        )
+        @test only(st) == expected
+        @test only(pmin) ≈ min(1.0, abs(w22 - 1) / w22) rtol = 1.0e-3
+    end
+    @test DiffEqGPU.lane_pivot_status(NaN) == DiffEqGPU.LANE_PIVOT
+    @test DiffEqGPU.lane_retcode(DiffEqGPU.LANE_PIVOT) == SciMLBase.ReturnCode.Unstable
     # A matching uses a pattern entry that is zero in the values only where no zero-free one
     # exists.
     A = zeros(5, 5)

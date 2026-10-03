@@ -65,8 +65,7 @@ already small relative to its column in the current W (the order was chosen at t
 step's `dt`) keeps `σ = 1`.
 """
 @inline function lane_pivot_status(σ)
-    # TODO: the pivot guard (threshold on σ, and what a lane does when it is crossed).
-    return LANE_ACTIVE
+    return !(σ >= 1e-8) ? LANE_PIVOT : LANE_ACTIVE
 end
 
 _lane_sparse(prototype) = prototype isa SparseMatrixCSC
