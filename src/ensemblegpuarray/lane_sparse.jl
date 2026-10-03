@@ -76,10 +76,12 @@ step's `dt`) keeps `σ = 1`.
 """
 @inline function lane_pivot_status(σ)
     # Finite-difference Jacobians are accurate to about sqrt(eps) ≈ 1.5e-8 (forward
-    # differences), so a cancelling pivot shows up as σ near that noise rather than below it:
-    # 1e-5 catches pivots that lost five digits, two orders below the smallest σ seen on a
-    # 190-state DAE's parameter grid (1e-3).
-    return !(σ >= 1e-5) ? LANE_PIVOT : LANE_ACTIVE
+    # differences), so a cancelling pivot shows up as σ near that noise rather than below it.
+    # On a 190-state DAE's parameter grid, σ went down to 1.8e-7 over the steps, and
+    # the fixed order solved those W as accurately as the dense LU (the two differed by much
+    # less than a one-ulp change of the initial state moves the trajectories); 1e-7 keeps
+    # them on the fixed order while staying above the noise.
+    return !(σ >= 1.0e-7) ? LANE_PIVOT : LANE_ACTIVE
 end
 
 _lane_sparse(prototype) = prototype isa SparseMatrixCSC
