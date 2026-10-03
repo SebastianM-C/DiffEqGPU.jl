@@ -264,8 +264,7 @@ factorization of the solve; this works when the large entries stay where they ar
 models whose algebraic equations keep their structure, and makes the factorizations and
 solves a fraction of dense LU's. The pattern must contain every entry the right-hand side can
 make nonzero: with the coloring, a missing entry also corrupts other stored entries. Each
-trajectory's factorization and solves run on a group of threads for batches below several
-thousand trajectories and on a thread per trajectory above.
+trajectory's factorization and solves run on a group of threads.
 
 # Examples
 

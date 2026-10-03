@@ -242,7 +242,6 @@ struct LaneStepper{T, Tt, M, S, V, I8, I32, BV, TB, CO, F, P, CB}
     lu::Any         # `LaneSparseLU` once the pivot order is chosen, or `nothing`
     lu_scratch::Any # B × N scratch of the sparse factorization and solves
     pivot_min::Any  # B smallest pivot ratio of the sparse factorizations so far
-    lu_threads::Int # threads per lane of the sparse factorization and solves (1: per-lane kernels)
     norm_weights::Any # N weights of a `ComponentNorm` (1 kept, 0 not), or `nothing`
     nkeep::Int      # the number of components in the error norm
     backend::Any
@@ -900,7 +899,7 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
         ipiv = lu_pivots(W)
     else
         # W and its operation list are set up after the first Jacobians (`_lane_sparse_setup`).
-        J = _lane_values(u0, T, B, nnz(pattern), _lane_sparse_threads(B))
+        J = _lane_values(u0, T, B, nnz(pattern))
         W = similar(u0, T, B, 0)
         ipiv = nothing
     end
@@ -920,9 +919,8 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
         dev(stops), dev(stop_mask), dev(savet), saves,
         LaneRodasTableau(T), LaneControllerOptions(T), abstol, reltol, dtmin, dtmax,
         maxiters, restore_stop_dt, f, p, callbacks, sparsity, nothing,
-        pattern === nothing ? nothing : _lane_values(u0, T, B, N, _lane_sparse_threads(B)),
+        pattern === nothing ? nothing : _lane_values(u0, T, B, N),
         pattern === nothing ? nothing : lv(one(T), T),
-        pattern === nothing ? 0 : _lane_sparse_threads(B),
         norm_weights, nkeep,
         backend
     )
@@ -1055,13 +1053,8 @@ function _lane_factorize!(st, wgs)
             ndrange = (N, N, B), workgroupsize = (min(N, 16), min(N, 16), 1)
         )
         batched_lufact!(backend, st.W, st.ipiv)
-    elseif st.lu_threads == 1
-        lane_sparse_factor_kernel(backend)(
-            st.W, st.lu_scratch, st.pivot_min, st.status, st.J, st.mass_diag, st.dt,
-            st.tab.gamma, st.lu; ndrange = B, workgroupsize = wgs
-        )
     else
-        S, L, Bp = _lane_coop_shape(st.lu_threads, B)
+        S, L, Bp = _lane_coop_shape(LANE_SPARSE_FACTOR_THREADS, B)
         lane_sparse_factor_coop_kernel(backend)(
             st.W, st.lu_scratch, st.pivot_min, st.status, st.J, st.mass_diag, st.dt,
             st.tab.gamma, st.lu, B; ndrange = (S, Bp), workgroupsize = (S, L)
@@ -1075,12 +1068,8 @@ function _lane_ldiv!(st, wgs)
     N, B = size(st.u)
     if st.lu === nothing
         batched_ldiv!(st.backend, st.W, st.tmp, st.ipiv, N, B)
-    elseif st.lu_threads == 1
-        lane_sparse_solve_kernel(st.backend)(
-            st.tmp, st.lu_scratch, st.W, st.status, st.lu; ndrange = B, workgroupsize = wgs
-        )
     else
-        S, L, Bp = _lane_coop_shape(st.lu_threads, B)
+        S, L, Bp = _lane_coop_shape(_lane_sparse_solve_threads(B), B)
         lane_sparse_solve_coop_kernel(st.backend)(
             st.tmp, st.lu_scratch, st.W, st.status, st.lu, B; ndrange = (S, Bp), workgroupsize = (S, L)
         )

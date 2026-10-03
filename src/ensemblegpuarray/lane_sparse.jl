@@ -77,13 +77,13 @@ end
 
 _lane_sparse(prototype) = prototype isa SparseMatrixCSC
 
-# Threads per lane of the sparse factorization and solves. A thread per lane runs the whole
-# operation list sequentially, which only keeps a GPU busy with many lanes; below that, the
-# lane's updates are spread over a group of threads (measured crossover on an RTX 4080 with a
-# 124-state model: about 8k lanes).
-const LANE_SPARSE_COOP_MAX_LANES = 8192
-const LANE_SPARSE_COOP_THREADS = 32
-_lane_sparse_threads(B) = B >= LANE_SPARSE_COOP_MAX_LANES ? 1 : LANE_SPARSE_COOP_THREADS
+# Threads per lane of the sparse factorization and of the solves. Each lane's updates are
+# spread over a group of threads (one barrier per pivot); a pivot's factorization updates are
+# numerous enough for 64 threads, a solve's fewer, so the solves use fewer threads as the batch
+# grows. Measured on an A100 and an H100 PCIe (124- and 190-state DAE, 512 to 32768 lanes):
+# this beat a thread per lane (`lane_sparse_factor_kernel`) at every batch size.
+const LANE_SPARSE_FACTOR_THREADS = 64
+_lane_sparse_solve_threads(B) = clamp(prevpow(2, max(1, 65536 ÷ max(B, 1))), 8, 64)
 
 # Workgroups of `S` threads for each of `L` lanes (128 threads), and the padded lane count.
 function _lane_coop_shape(S, B)
@@ -91,12 +91,11 @@ function _lane_coop_shape(S, B)
     return S, L, cld(B, L) * L
 end
 
-# B × n per-lane values, indexed `[lane, entry]`: stored lane-fastest for the per-lane kernels,
-# entry-fastest (a lane's values contiguous) for the cooperative ones.
-function _lane_values(like, ::Type{T}, B, n, threads) where {T}
-    threads == 1 && return fill!(similar(like, T, B, n), zero(T))
-    return PermutedDimsArray(fill!(similar(like, T, n, B), zero(T)), (2, 1))
-end
+# B × n per-lane values, indexed `[lane, entry]` and stored entry-fastest (a lane's values
+# contiguous), as the cooperative kernels read them. The per-lane kernels take lane-fastest
+# storage (`B × n` arrays).
+_lane_values(like, ::Type{T}, B, n) where {T} =
+    PermutedDimsArray(fill!(similar(like, T, n, B), zero(T)), (2, 1))
 _lane_entry_max(V) = vec(maximum(abs, V; dims = 1))
 _lane_entry_max(V::PermutedDimsArray) = vec(maximum(abs, parent(V); dims = 2))
 
@@ -641,7 +640,7 @@ function _lane_sparse_setup(st, PJ, mass)
     rowo, colo = _lane_sparse_order(Wabs, P)
     lu = _lane_sparse_lu(P, PJ, rowo, colo)
     T = eltype(st.J)
-    W = _lane_values(st.u, T, length(st.t), lu.nslot, st.lu_threads)
+    W = _lane_values(st.u, T, length(st.t), lu.nslot)
     st = @set st.lu = adapt(st.backend, lu)
     return @set st.W = W
 end
