@@ -327,32 +327,40 @@ end
 end
 
 # Store k_{s-1} = -(solution of the last solve) and form the stage state
-# u = uprev + Σ_{j<s} A[s, j] k_j.
-@kernel function lane_stage_state_kernel(u, K, @Const(tmp), @Const(uprev), @Const(s), @Const(tab), @Const(status))
+# u = uprev + Σ_{j<s} a[j] k_j, with `a` row `s` of the tableau's A. The row is passed as an
+# `SVector` and the loop has a constant bound so that it unrolls into registers: indexing the
+# tableau's matrices with the runtime `s` puts them in local memory, which made this kernel
+# about 40× slower.
+@kernel function lane_stage_state_kernel(u, K, @Const(tmp), @Const(uprev), @Const(s), @Const(a), @Const(status))
     k, i = @index(Global, NTuple)
     @inbounds if status[i] == LANE_ACTIVE
         K[k, i, s - 1] = -tmp[k, i]
         acc = uprev[k, i]
-        for j in 1:(s - 1)
-            acc += tab.A[s, j] * K[k, i, j]
+        for j in 1:7
+            if j < s
+                acc += a[j] * K[k, i, j]
+            end
         end
         u[k, i] = acc
     end
 end
 
-# Stage `s` right-hand side: du + dt d[s] ∂f/∂t + M Σ_{j<s} C[s, j] k_j / dt.
+# Stage `s` right-hand side: du + dt d_s ∂f/∂t + M Σ_{j<s} c[j] k_j / dt, with `c` row `s`
+# of the tableau's C and `d_s = d[s]` (see `lane_stage_state_kernel` for why a row).
 @kernel function lane_stage_rhs_kernel(
         tmp, @Const(du), @Const(dT), @Const(K), @Const(mass_diag), @Const(dt), @Const(s),
-        @Const(tab), @Const(status)
+        @Const(c), @Const(d_s), @Const(status)
     )
     k, i = @index(Global, NTuple)
     @inbounds if status[i] == LANE_ACTIVE
         h = dt[i]
         acc = zero(eltype(tmp))
-        for j in 1:(s - 1)
-            acc += tab.C[s, j] * K[k, i, j]
+        for j in 1:7
+            if j < s
+                acc += c[j] * K[k, i, j]
+            end
         end
-        tmp[k, i] = du[k, i] + h * tab.d[s] * dT[k, i] +
+        tmp[k, i] = du[k, i] + h * d_s * dT[k, i] +
             _mass_diagonal(mass_diag, k, tmp) * acc / h
     end
 end
@@ -958,11 +966,12 @@ function lane_step!(st, iip, wgs)
     batched_ldiv!(backend, st.W, st.tmp, st.ipiv, N, B)
     for s in 2:8
         lane_stage_state_kernel(backend)(
-            st.u, st.K, st.tmp, st.uprev, s, tab, st.status; ndrange = nb, workgroupsize = nbwgs
+            st.u, st.K, st.tmp, st.uprev, s, tab.A[s, :], st.status;
+            ndrange = nb, workgroupsize = nbwgs
         )
         rhs!(st.du, st.u, tab.c[s], false)
         lane_stage_rhs_kernel(backend)(
-            st.tmp, st.du, st.dT, st.K, st.mass_diag, st.dt, s, tab, st.status;
+            st.tmp, st.du, st.dT, st.K, st.mass_diag, st.dt, s, tab.C[s, :], tab.d[s], st.status;
             ndrange = nb, workgroupsize = nbwgs
         )
         batched_ldiv!(backend, st.W, st.tmp, st.ipiv, N, B)
