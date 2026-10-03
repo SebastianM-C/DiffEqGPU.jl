@@ -119,6 +119,28 @@ end
     end
 end
 
+@testset "tstops one ulp from a periodic stop" begin
+    # Save times as tstops next to a 10 ms periodic callback: 0.7 is one ulp below 70 × 0.01.
+    # The two are one stop (no step of an ulp between them), and the solve matches
+    # OrdinaryDiffEq's.
+    stops, masks = DiffEqGPU._lane_stops((DiffEqGPU.LanePeriodic(kick!, 0.01, 0.0, false, false, (false, false)),), collect(0.0:0.1:1.0), 0.0, 1.0, Float64)
+    @test !any(<(1.0e-12), diff(stops))
+    @test stops[findfirst(s -> abs(s - 0.7) < 1.0e-12, stops)] == 70 * 0.01
+    @test all(m -> m == 1, masks[1:(end - 1)])
+    @test last(stops) == 1.0
+    cb() = PeriodicCallback(kick!, 0.01; save_positions = (false, false))
+    prob = ODEProblem(decay!, [1.0, 0.0], (0.0, 1.0), [1.0, 0.3]; callback = cb())
+    eprob = EnsembleProblem(prob; prob_func = decay_func, safetycopy = false)
+    kwargs = (; abstol = 1.0e-7, reltol = 1.0e-7, saveat = 0.1, tstops = collect(0.0:0.1:1.0))
+    sol = solve(eprob, alg, lanes(); trajectories = 2, kwargs...)
+    for i in 1:2
+        ref = solve(decay_func(remake(prob; callback = cb()), (; sim_id = i)), alg; kwargs...)
+        @test sol.u[i].retcode == SciMLBase.ReturnCode.Success
+        @test sol.u[i].t == ref.t
+        @test max_state_error(sol.u[i], ref) < 1.0e-7
+    end
+end
+
 @testset "A failing trajectory stops alone" begin
     prob = ODEProblem(decay!, [1.0, 0.0], (0.0, 2.0), [1.0, 0.3])
     ps = [[1.0, 0.3], [NaN, 0.3], [2.0, 0.3]]

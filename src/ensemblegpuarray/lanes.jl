@@ -743,7 +743,24 @@ function _lane_stops(callbacks, tstops, t0, tf, ::Type{Tt}) where {Tt}
         cb.final_affect && (stops[Tt(tf)] |= bit)
     end
     times = sort!(collect(keys(stops)))
-    return times, UInt32[stops[s] for s in times]
+    masks = UInt32[stops[s] for s in times]
+    # Stops closer than OrdinaryDiffEq's tstop snapping tolerance are one stop (e.g. a save time
+    # 0.7 one ulp before a periodic tick 70 × 0.01): otherwise the lane takes a step of an ulp
+    # between them. The merged stop keeps the time of the one where callbacks fire (the final
+    # time if it is one of them) and the callbacks of both.
+    merged_t = Tt[]
+    merged_m = UInt32[]
+    for (s, m) in zip(times, masks)
+        if !isempty(merged_t) && s - merged_t[end] <= 100 * eps(max(abs(s), abs(merged_t[end])))
+            keep_new = s == Tt(tf) || (merged_m[end] == 0 && m != 0 && merged_t[end] != Tt(tf))
+            keep_new && (merged_t[end] = s)
+            merged_m[end] |= m
+        else
+            push!(merged_t, s)
+            push!(merged_m, m)
+        end
+    end
+    return merged_t, merged_m
 end
 
 function _lane_jacobian_mode(alg)
