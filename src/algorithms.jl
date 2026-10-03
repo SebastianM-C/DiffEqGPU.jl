@@ -232,7 +232,7 @@ A trajectory that fails (`ReturnCode.Unstable`, `DtLessThanMin`, `MaxIters`) sto
 others continue. Supported: `Rodas5P` with `autodiff = AutoFiniteDiff()` (forward or central
 differences), diagonal mass matrices including singular ones, scalar `abstol` and `reltol`,
 `saveat` (or `save_everystep = false`), `save_start`, `save_end`, `dt`, `dtmax`, `tstops`,
-`maxiters`, and DiffEqCallbacks' `PeriodicCallback`s, including those of ModelingToolkit's
+`maxiters`, a sparse `jac_prototype` (see below), and DiffEqCallbacks' `PeriodicCallback`s, including those of ModelingToolkit's
 periodic events, with `save_positions = (false, false)`. Other callbacks and options throw an
 `ArgumentError`. Saved values between two steps are interpolated with `Rodas5P`'s dense
 output; at a time where a periodic affect fires, the value before the affect is saved, as
@@ -250,6 +250,19 @@ equal tolerance and about 1.2 times fewer at matched achieved error, without mor
 steps. The step after a stop is then sized for the error of a full step although the
 shortened step's error estimate was smaller, so its achieved error can be slightly larger at
 a given tolerance; compare the two at matched error, not at equal tolerance.
+
+With a `SparseMatrixCSC` `jac_prototype` (the pattern of the Jacobian of one trajectory), the
+stepper stores each trajectory's Jacobian as the values of that pattern, computes it with one
+right-hand side evaluation per color of a column coloring instead of one per state, and
+factorizes the iteration matrices with a sparse LU. The pivot order of that LU is chosen
+once, from the iteration matrices of the first step of all trajectories (a maximum-product
+row matching and a minimum-degree ordering), and used without pivoting for every
+factorization of the solve; this works when the large entries stay where they are, as in
+models whose algebraic equations keep their structure, and makes the factorizations and
+solves a fraction of dense LU's. The pattern must contain every entry the right-hand side can
+make nonzero: with the coloring, a missing entry also corrupts other stored entries. Each
+trajectory's factorization and solves run on a group of threads for batches below several
+thousand trajectories and on a thread per trajectory above.
 
 # Examples
 

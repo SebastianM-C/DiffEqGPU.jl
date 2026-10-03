@@ -6,7 +6,7 @@ module DiffEqGPU
 using DocStringExtensions: DocStringExtensions
 using SciMLPublic: @public
 using EnzymeCore: within_autodiff
-using KernelAbstractions: KernelAbstractions, @Const, @groupsize, @index, @kernel, @synchronize,
+using KernelAbstractions: KernelAbstractions, @Const, @groupsize, @index, @kernel, @synchronize, @uniform,
     CPU
 import KernelAbstractions: get_backend, allocate
 using SciMLBase: SciMLBase, CallbackSet, CheckInit, ContinuousCallback,
@@ -43,6 +43,7 @@ using PrecompileTools: @compile_workload, @setup_workload
 using MuladdMacro: MuladdMacro, @muladd
 using Random: Random
 using Setfield: Setfield, @set, @set!
+using SparseArrays: SparseMatrixCSC, findnz, nnz, nzrange, rowvals, sparse
 using UnPack: @unpack
 # StaticArraysCore-owned type alias (re-exported by StaticArrays); used in dispatch.
 import StaticArrays: StaticVecOrMat
@@ -239,6 +240,7 @@ include("utils.jl")
 include("algorithms.jl")
 include("ensemblegpuarray/initialization.jl")
 include("ensemblegpuarray/lanes.jl")
+include("ensemblegpuarray/lane_sparse.jl")
 include("solve.jl")
 export EnsembleProblem, EnsembleSolution, EnsembleSerial, EnsembleThreads,
     EnsembleDistributed

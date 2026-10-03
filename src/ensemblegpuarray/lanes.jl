@@ -38,12 +38,14 @@ const LANE_SUCCESS = Int8(1)
 const LANE_UNSTABLE = Int8(2)
 const LANE_DTMIN = Int8(3)
 const LANE_MAXITERS = Int8(4)
+const LANE_PIVOT = Int8(5)
 
 function lane_retcode(status)
     status == LANE_SUCCESS && return ReturnCode.Success
     status == LANE_UNSTABLE && return ReturnCode.Unstable
     status == LANE_DTMIN && return ReturnCode.DtLessThanMin
     status == LANE_MAXITERS && return ReturnCode.MaxIters
+    status == LANE_PIVOT && return ReturnCode.Unstable
     return ReturnCode.Failure
 end
 
@@ -195,14 +197,14 @@ struct LaneStepper{T, Tt, M, S, V, I8, I32, BV, TB, CO, F, P, CB}
     dT::M           # N × B ∂f/∂t at (uprev, t)
     tmp::M          # N × B linear-solve right-hand side and solution
     K::S            # N × B × 8 stage increments
-    J::S            # N × N × B Jacobians (kept across rejected steps)
-    W::S            # N × N × B iteration matrices, LU-factored in place
+    J::Any          # N × N × B Jacobians (kept across rejected steps); B × nnz with a sparse pattern
+    W::Any          # N × N × B iteration matrices, LU-factored in place; B × nslot with a sparse pattern
     ipiv::Any
     mass_diag::Any  # length-N diagonal of the mass matrix, or `nothing`
     up::M           # finite-difference scratch, (ncols B) × N
     fp::M
     fm::M
-    ncols::Int
+    ncols::Int      # columns (colors with a sparse pattern) per finite-difference launch
     central::Bool
     t::V            # B lane times
     dt::V           # B step sizes of the next attempt
@@ -236,6 +238,11 @@ struct LaneStepper{T, Tt, M, S, V, I8, I32, BV, TB, CO, F, P, CB}
     f::F
     p::P
     callbacks::CB
+    sparsity::Any   # `LaneSparsity` of a sparse `jac_prototype`, or `nothing` (dense)
+    lu::Any         # `LaneSparseLU` once the pivot order is chosen, or `nothing`
+    lu_scratch::Any # B × N scratch of the sparse factorization and solves
+    pivot_min::Any  # B smallest pivot ratio of the sparse factorizations so far
+    lu_threads::Int # threads per lane of the sparse factorization and solves (1: per-lane kernels)
     backend::Any
 end
 
@@ -773,7 +780,17 @@ function _lane_settings(prob, alg, ensemblealg; adaptive = true, kwargs...)
     )
     _check_lane_algorithm(alg)
     central = _lane_jacobian_mode(alg)
-    _mass_matrix_diagonal(prob.f.mass_matrix, length(prob.u0))
+    N = length(prob.u0)
+    mass = _mass_matrix_diagonal(prob.f.mass_matrix, N)
+    pattern = nothing
+    if _lane_sparse(prob.f.jac_prototype)
+        pattern = _lane_sparsity_pattern(prob.f.jac_prototype, N)
+        _lane_structurally_nonsingular(_lane_w_pattern(pattern, mass)) || throw(
+            ArgumentError(
+                "`per_trajectory_dt = true`: the `jac_prototype` pattern (with the diagonal where the mass matrix is nonzero) is structurally singular, so every iteration matrix would be singular."
+            )
+        )
+    end
     opts = _lane_options(prob, kwargs)
     t0, tf = prob.tspan
     tf > t0 || throw(ArgumentError("`per_trajectory_dt = true` needs a forward time span."))
@@ -792,7 +809,7 @@ function _lane_settings(prob, alg, ensemblealg; adaptive = true, kwargs...)
     save_end = get(opts, :save_end, true)
     callbacks = _lane_callbacks(prob, ensemblealg; kwargs...)
     return (;
-        opts, central, abstol, reltol, saveat, save_start, save_end, callbacks,
+        opts, central, pattern, abstol, reltol, saveat, save_start, save_end, callbacks,
         dtmax = get(opts, :dtmax, tf - t0), maxiters = get(opts, :maxiters, 100_000),
         restore_stop_dt = Bool(get(opts, :restore_stop_dt, false)), tstops = get(opts, :tstops, ()),
     )
@@ -827,14 +844,24 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
 
     dev(x) = adapt(backend, x)
     zN() = fill!(similar(u0, T, N, B), zero(T))
+    pattern = set.pattern
+    sparsity = pattern === nothing ? nothing : dev(_lane_sparsity(pattern))
+    ncolumns = pattern === nothing ? N : length(sparsity.color_ptr) - 1
     ncols = let by_threads = cld(FD_TARGET_THREADS, B),
             by_memory = FD_SCRATCH_BYTES ÷ ((central ? 3 : 2) * N * B * sizeof(T))
 
-        clamp(min(by_threads, by_memory), 1, N)
+        clamp(min(by_threads, by_memory), 1, ncolumns)
     end
-    J = fill!(similar(u0, T, N, N, B), zero(T))
-    W = similar(J)
-    ipiv = lu_pivots(W)
+    if pattern === nothing
+        J = fill!(similar(u0, T, N, N, B), zero(T))
+        W = similar(J)
+        ipiv = lu_pivots(W)
+    else
+        # W and its operation list are set up after the first Jacobians (`_lane_sparse_setup`).
+        J = _lane_values(u0, T, B, nnz(pattern), _lane_sparse_threads(B))
+        W = similar(u0, T, B, 0)
+        ipiv = nothing
+    end
     lv(x, ::Type{X}) where {X} = fill!(similar(u0, X, B), x)
     saves = fill!(similar(u0, T, N, max(length(savet), 1), B), zero(T))
 
@@ -850,7 +877,11 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
         lv(Int32(1), Int32), lv(Int32(0), Int32), lv(Int32(0), Int32),
         dev(stops), dev(stop_mask), dev(savet), saves,
         LaneRodasTableau(T), LaneControllerOptions(T), abstol, reltol, dtmin, dtmax,
-        maxiters, restore_stop_dt, f, p, callbacks, backend
+        maxiters, restore_stop_dt, f, p, callbacks, sparsity, nothing,
+        pattern === nothing ? nothing : _lane_values(u0, T, B, N, _lane_sparse_threads(B)),
+        pattern === nothing ? nothing : lv(one(T), T),
+        pattern === nothing ? 0 : _lane_sparse_threads(B),
+        backend
     )
 
     # The start: save, initial affects, then the initial step size from the state after them.
@@ -869,6 +900,13 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
     _lane_initial_dt!(st, opts, iip, isdae, t0)
 
     wgs = workgroupsize(backend, B)
+    if pattern !== nothing
+        # The pivot order comes from the first iteration matrices of all lanes; the first
+        # step attempt then uses the Jacobians computed for it.
+        _lane_jacobian!(st, iip, wgs)
+        st = _lane_sparse_setup(st, pattern, _mass_matrix_diagonal(prob.f.mass_matrix, N))
+        fill!(st.fresh, false)
+    end
     while count(==(LANE_ACTIVE), st.status) > 0
         lane_step!(st, iip, wgs)
     end
@@ -878,6 +916,7 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
     return (;
         savet, saves = Array(st.saves), nsaved, status,
         naccept = Array(st.naccept), nreject = Array(st.nreject), p = st.p,
+        pivot_min = st.pivot_min === nothing ? nothing : Array(st.pivot_min),
     )
 end
 
@@ -923,13 +962,94 @@ function _lane_initial_dt!(st, opts, iip, isdae, t0)
     return nothing
 end
 
+# f, ∂f/∂t and J at (uprev, t) for the lanes that moved (`fresh`); rejected lanes keep theirs.
+function _lane_jacobian!(st, iip, wgs)
+    backend = st.backend
+    N, B = size(st.u)
+    Tt = eltype(st.t)
+    T = eltype(st.u)
+    lane_rhs_kernel(backend)(
+        st.f, iip, st.fsal, st.uprev, st.p, st.t, st.dt, zero(Tt), st.status, st.fresh, true;
+        ndrange = B, workgroupsize = wgs
+    )
+    lane_tgrad_kernel(backend)(
+        st.f, iip, st.dT, st.du, st.uprev, st.fsal, st.p, st.t, st.status, st.fresh,
+        sqrt(eps(T)); ndrange = B, workgroupsize = wgs
+    )
+    rel = st.central ? cbrt(eps(T)) : sqrt(eps(T))
+    if st.sparsity === nothing
+        for jlo in 1:st.ncols:N
+            ncols = min(st.ncols, N - jlo + 1)
+            n = ncols * B
+            lane_fd_jacobian_kernel(backend)(
+                st.f, iip, st.J, st.up, st.fp, st.fm, st.uprev, st.fsal, st.p, st.t, jlo,
+                ncols, rel, st.central, st.status, st.fresh;
+                ndrange = n, workgroupsize = workgroupsize(backend, n)
+            )
+        end
+    else
+        ncolors = length(st.sparsity.color_ptr) - 1
+        for clo in 1:st.ncols:ncolors
+            nc = min(st.ncols, ncolors - clo + 1)
+            n = nc * B
+            lane_fd_jacobian_sparse_kernel(backend)(
+                st.f, iip, st.J, st.up, st.fp, st.fm, st.uprev, st.fsal, st.p, st.t, clo,
+                nc, rel, st.central, st.status, st.fresh, st.sparsity;
+                ndrange = n, workgroupsize = workgroupsize(backend, n)
+            )
+        end
+    end
+    return nothing
+end
+
+# W = J - M / (dt γ), factorized, for every active lane.
+function _lane_factorize!(st, wgs)
+    backend = st.backend
+    N, B = size(st.u)
+    if st.lu === nothing
+        lane_w_kernel(backend)(
+            st.W, st.J, st.mass_diag, st.dt, st.tab.gamma, st.status;
+            ndrange = (N, N, B), workgroupsize = (min(N, 16), min(N, 16), 1)
+        )
+        batched_lufact!(backend, st.W, st.ipiv)
+    elseif st.lu_threads == 1
+        lane_sparse_factor_kernel(backend)(
+            st.W, st.lu_scratch, st.pivot_min, st.status, st.J, st.mass_diag, st.dt,
+            st.tab.gamma, st.lu; ndrange = B, workgroupsize = wgs
+        )
+    else
+        S, L, Bp = _lane_coop_shape(st.lu_threads, B)
+        lane_sparse_factor_coop_kernel(backend)(
+            st.W, st.lu_scratch, st.pivot_min, st.status, st.J, st.mass_diag, st.dt,
+            st.tab.gamma, st.lu, B; ndrange = (S, Bp), workgroupsize = (S, L)
+        )
+    end
+    return nothing
+end
+
+# tmp = W \ tmp for every active lane.
+function _lane_ldiv!(st, wgs)
+    N, B = size(st.u)
+    if st.lu === nothing
+        batched_ldiv!(st.backend, st.W, st.tmp, st.ipiv, N, B)
+    elseif st.lu_threads == 1
+        lane_sparse_solve_kernel(st.backend)(
+            st.tmp, st.lu_scratch, st.W, st.status, st.lu; ndrange = B, workgroupsize = wgs
+        )
+    else
+        S, L, Bp = _lane_coop_shape(st.lu_threads, B)
+        lane_sparse_solve_coop_kernel(st.backend)(
+            st.tmp, st.lu_scratch, st.W, st.status, st.lu, B; ndrange = (S, Bp), workgroupsize = (S, L)
+        )
+    end
+    return nothing
+end
+
 # One step attempt of every active lane.
 function lane_step!(st, iip, wgs)
     backend = st.backend
     N, B = size(st.u)
     tab = st.tab
-    Tt = eltype(st.t)
-    T = eltype(st.u)
     rhs!(du, u, cs, only_fresh) = lane_rhs_kernel(backend)(
         st.f, iip, du, u, st.p, st.t, st.dt, cs, st.status, st.fresh, only_fresh;
         ndrange = B, workgroupsize = wgs
@@ -937,33 +1057,13 @@ function lane_step!(st, iip, wgs)
     nb = (N, B)
     nbwgs = (min(N, 32), max(1, min(B, 256 ÷ min(N, 32))))
 
-    # f, ∂f/∂t and J at (uprev, t) for the lanes that moved; rejected lanes keep theirs.
-    rhs!(st.fsal, st.uprev, zero(Tt), true)
-    lane_tgrad_kernel(backend)(
-        st.f, iip, st.dT, st.du, st.uprev, st.fsal, st.p, st.t, st.status, st.fresh,
-        sqrt(eps(T)); ndrange = B, workgroupsize = wgs
-    )
-    rel = st.central ? cbrt(eps(T)) : sqrt(eps(T))
-    for jlo in 1:st.ncols:N
-        ncols = min(st.ncols, N - jlo + 1)
-        n = ncols * B
-        lane_fd_jacobian_kernel(backend)(
-            st.f, iip, st.J, st.up, st.fp, st.fm, st.uprev, st.fsal, st.p, st.t, jlo,
-            ncols, rel, st.central, st.status, st.fresh;
-            ndrange = n, workgroupsize = workgroupsize(backend, n)
-        )
-    end
-
-    lane_w_kernel(backend)(
-        st.W, st.J, st.mass_diag, st.dt, tab.gamma, st.status;
-        ndrange = (N, N, B), workgroupsize = (min(N, 16), min(N, 16), 1)
-    )
-    batched_lufact!(backend, st.W, st.ipiv)
+    _lane_jacobian!(st, iip, wgs)
+    _lane_factorize!(st, wgs)
 
     lane_stage1_kernel(backend)(
         st.tmp, st.fsal, st.dT, st.dt, tab.d[1], st.status; ndrange = nb, workgroupsize = nbwgs
     )
-    batched_ldiv!(backend, st.W, st.tmp, st.ipiv, N, B)
+    _lane_ldiv!(st, wgs)
     for s in 2:8
         lane_stage_state_kernel(backend)(
             st.u, st.K, st.tmp, st.uprev, s, tab.A[s, :], st.status;
@@ -974,7 +1074,7 @@ function lane_step!(st, iip, wgs)
             st.tmp, st.du, st.dT, st.K, st.mass_diag, st.dt, s, tab.C[s, :], tab.d[s], st.status;
             ndrange = nb, workgroupsize = nbwgs
         )
-        batched_ldiv!(backend, st.W, st.tmp, st.ipiv, N, B)
+        _lane_ldiv!(st, wgs)
     end
     lane_final_kernel(backend)(
         st.u, st.K, st.tmp, st.uprev, tab, st.status; ndrange = nb, workgroupsize = nbwgs

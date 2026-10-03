@@ -1,4 +1,4 @@
-using DiffEqGPU, LinearAlgebra, Test
+using DiffEqGPU, LinearAlgebra, SparseArrays, Test
 using OrdinaryDiffEqRosenbrock: Rodas5P, Rosenbrock23
 using DiffEqCallbacks: PeriodicCallback
 import SciMLBase
@@ -185,6 +185,119 @@ end
     @test length(unique(s.prob.ps[g] for s in sol.u)) > 1
 end
 
+# A DAE whose iteration matrix has a zero diagonal on every algebraic row, so the fixed pivot
+# order of the sparse LU needs its row matching: x_k' = -p_k x_k + z_k + x_{k-1} / 10 and
+# 0 = z_{k+1} - sin(x_k) - 1. Its columns need 3 colors instead of 2n perturbations.
+const chain_n = 12
+function chain!(du, u, p, t)
+    n = chain_n
+    for k in 1:n
+        du[k] = -p[k] * u[k] + u[n + k] + (k > 1 ? u[k - 1] / 10 : zero(eltype(u)))
+        du[n + k] = u[n + mod1(k + 1, n)] - sin(u[k]) - 1
+    end
+    return nothing
+end
+const chain_pattern = let n = chain_n, P = spzeros(2n, 2n)
+    for k in 1:n
+        P[k, k] = P[k, n + k] = 1
+        k > 1 && (P[k, k - 1] = 1)
+        P[n + k, n + mod1(k + 1, n)] = P[n + k, k] = 1
+    end
+    P
+end
+const chain_u0 = let n = chain_n, u = [fill(0.5, n); zeros(n)]
+    for k in 1:n
+        u[n + mod1(k + 1, n)] = sin(u[k]) + 1
+    end
+    u
+end
+chain_problem(jac_prototype) = ODEProblem(
+    ODEFunction(chain!; mass_matrix = Diagonal([ones(chain_n); zeros(chain_n)]), jac_prototype),
+    chain_u0, (0.0, 5.0), collect(range(1.0, 1.0e4; length = chain_n))
+)
+const chain_func = (prob, ctx) -> remake(prob; p = prob.p .* (1 + 0.3 * (ctx.sim_id - 1)))
+
+@testset "Sparse jac_prototype ($(fd) differences): colored Jacobian and static-pivot LU" for fd in (:forward, :central)
+    a = Rodas5P(autodiff = AutoFiniteDiff(fdtype = Val(fd)))
+    kwargs = (; abstol = 1.0e-8, reltol = 1.0e-6, saveat = 0.5)
+    ens(prob) = EnsembleProblem(prob; prob_func = chain_func, safetycopy = false)
+    sparse_sol = solve(ens(chain_problem(chain_pattern)), a, lanes(); trajectories = 6, kwargs...)
+    dense_sol = solve(ens(chain_problem(nothing)), a, lanes(); trajectories = 6, kwargs...)
+    for i in 1:6
+        s, d = sparse_sol.u[i], dense_sol.u[i]
+        @test s.retcode == SciMLBase.ReturnCode.Success
+        # The colored differences equal the per-column ones; only the LU's rounding differs.
+        @test s.t == d.t
+        @test max_state_error(s, d) < 1.0e-8
+        @test abs(s.stats.naccept - d.stats.naccept) <= 1
+        @test abs(s.stats.nreject - d.stats.nreject) <= 1
+    end
+    @test length(unique(s.stats.naccept for s in sparse_sol.u)) > 1
+end
+
+@testset "Sparse jac_prototype: the pieces" begin
+    PJ = DiffEqGPU._lane_sparsity_pattern(chain_pattern, 2chain_n)
+    sp = DiffEqGPU._lane_sparsity(PJ)
+    ptr, cols = Int.(sp.color_ptr), Int.(sp.color_cols)
+    @test sort(cols) == 1:(2chain_n)
+    @test length(ptr) - 1 == 3
+    for c in 1:(length(ptr) - 1)
+        rows = [rowvals(PJ)[e] for j in cols[ptr[c]:(ptr[c + 1] - 1)] for e in nzrange(PJ, j)]
+        @test allunique(rows)   # no two columns of a color share a row
+    end
+    # The operation list of the fixed order solves W x = b as pivoted dense LU does, on a W
+    # with this pattern (the factor and solve kernels, run on the CPU).
+    N = 2chain_n
+    mass = [ones(chain_n); zeros(chain_n)]
+    P = DiffEqGPU._lane_w_pattern(PJ, mass)
+    @test P == Matrix(PJ)   # the differential rows' diagonal is in the pattern already
+    W = [P[i, j] ? 1 + 3 * sin(i + 2j)^2 : 0.0 for i in 1:N, j in 1:N]
+    rowo, colo = DiffEqGPU._lane_sparse_order(abs.(W), P)
+    @test all(P[rowo[k], colo[k]] for k in 1:N)   # a zero-free diagonal
+    lu = DiffEqGPU._lane_sparse_lu(P, PJ, rowo, colo)
+    cpu = DiffEqGPU.KernelAbstractions.CPU()
+    Jv = reshape([W[rowvals(PJ)[e], j] for j in 1:N for e in nzrange(PJ, j)], 1, :)
+    Wv = zeros(1, lu.nslot)
+    scratch = zeros(1, N)
+    status = [DiffEqGPU.LANE_ACTIVE]
+    DiffEqGPU.lane_sparse_factor_kernel(cpu)(
+        Wv, scratch, [1.0], status, Jv, zeros(N), [1.0], 1.0, lu; ndrange = 1
+    )
+    b = [cos(3k) for k in 1:N]
+    x = reshape(copy(b), N, 1)
+    DiffEqGPU.lane_sparse_solve_kernel(cpu)(x, scratch, Wv, status, lu; ndrange = 1)
+    @test vec(x) ≈ W \ b rtol = 1.0e-12
+    # The cooperative kernels (4 threads per lane, 2 lanes per workgroup: one padded lane),
+    # with the values stored slot-major.
+    slotmajor(A) = PermutedDimsArray(Matrix(permutedims(A)), (2, 1))
+    Wc, scratch_c = slotmajor(zeros(1, lu.nslot)), slotmajor(zeros(1, N))
+    DiffEqGPU.lane_sparse_factor_coop_kernel(cpu)(
+        Wc, scratch_c, [1.0], status, slotmajor(Jv), zeros(N), [1.0], 1.0, lu, 1;
+        ndrange = (4, 2), workgroupsize = (4, 2)
+    )
+    xc = reshape(copy(b), N, 1)
+    DiffEqGPU.lane_sparse_solve_coop_kernel(cpu)(
+        xc, scratch_c, Wc, status, lu, 1; ndrange = (4, 2), workgroupsize = (4, 2)
+    )
+    @test vec(xc) ≈ W \ b rtol = 1.0e-12
+    # A matching uses a pattern entry that is zero in the values only where no zero-free one
+    # exists.
+    A = zeros(5, 5)
+    Pz = falses(5, 5)
+    for j in 1:4
+        A[j, j] = 10
+        A[j + 1, j] = 1
+        Pz[j, j] = Pz[j + 1, j] = true
+    end
+    A[1, 5] = 10
+    Pz[1, 5] = Pz[5, 5] = true
+    rowof = DiffEqGPU._lane_maxprod_matching(A, Pz)
+    @test all(!iszero, A[rowof[j], j] for j in 1:5)
+    P0 = copy(P)
+    P0[:, 1] .= false
+    @test !DiffEqGPU._lane_structurally_nonsingular(P0)
+end
+
 @testset "Unsupported settings throw, at setup and in the solve" begin
     prob = ODEProblem(decay!, [1.0, 0.0], (0.0, 1.0), [1.0, 0.3])
     eprob = EnsembleProblem(prob; prob_func = decay_func, safetycopy = false)
@@ -204,6 +317,14 @@ end
     for (a, kwargs) in cases
         @test_throws ArgumentError DiffEqGPU.check_per_trajectory_dt(prob, a, lanes(); kwargs...)
         @test_throws ArgumentError solve(eprob, a, lanes(); trajectories = 2, kwargs...)
+    end
+    # A sparse `jac_prototype` of the wrong size, or one no row permutation makes zero-free on
+    # the diagonal (with the mass matrix's diagonal: here the algebraic row 2 is empty).
+    for f in (
+            ODEFunction(decay!; jac_prototype = sparse(1.0I, 3, 3)),
+            ODEFunction(decay!; mass_matrix = Diagonal([1.0, 0.0]), jac_prototype = sparse([1], [1], [1.0], 2, 2)),
+        )
+        @test_throws ArgumentError DiffEqGPU.check_per_trajectory_dt(remake(prob; f), alg, lanes(); good...)
     end
     # Options stored in the problem are checked too.
     @test_throws ArgumentError DiffEqGPU.check_per_trajectory_dt(remake(prob; save_idxs = [1]), alg, lanes(); good...)
