@@ -75,7 +75,11 @@ already small relative to its column in the current W (the order was chosen at t
 step's `dt`) keeps `σ = 1`.
 """
 @inline function lane_pivot_status(σ)
-    return !(σ >= 1e-8) ? LANE_PIVOT : LANE_ACTIVE
+    # Finite-difference Jacobians are accurate to about sqrt(eps) ≈ 1.5e-8 (forward
+    # differences), so a cancelling pivot shows up as σ near that noise rather than below it:
+    # 1e-5 catches pivots that lost five digits, two orders below the smallest σ seen on a
+    # 190-state DAE's parameter grid (1e-3).
+    return !(σ >= 1e-5) ? LANE_PIVOT : LANE_ACTIVE
 end
 
 _lane_sparse(prototype) = prototype isa SparseMatrixCSC
