@@ -46,8 +46,15 @@ struct LaneSparseLU{I}
     Urow::I
     Uslot::I
 end
+# Field by field: KernelAbstractions' `@Const` adapts this inside the kernel, where a splat of
+# a generator over the 18 fields is not always inferred (Julia 1.13.0 leaves it dynamic).
 function Adapt.adapt_structure(to, lu::LaneSparseLU)
-    return LaneSparseLU((adapt(to, getfield(lu, f)) for f in fieldnames(LaneSparseLU))...)
+    a(x) = adapt(to, x)
+    return LaneSparseLU(
+        lu.nslot, a(lu.jslot), a(lu.mslot), a(lu.rowo), a(lu.colo), a(lu.piv), a(lu.divptr),
+        a(lu.div_t), a(lu.fmaptr), a(lu.fma_t), a(lu.fma_l), a(lu.fma_u), a(lu.Lptr), a(lu.Lrow),
+        a(lu.Lslot), a(lu.Uptr), a(lu.Urow), a(lu.Uslot)
+    )
 end
 
 """

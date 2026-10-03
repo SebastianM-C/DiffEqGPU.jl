@@ -280,6 +280,29 @@ end
         xc, scratch_c, Wc, status, lu, 1; ndrange = (4, 2), workgroupsize = (4, 2)
     )
     @test vec(xc) ≈ W \ b rtol = 1.0e-12
+    # Both kernel shapes on the test backend (the solves with fewer than 8192 trajectories use
+    # only the cooperative ones), from the device copy of the operation list.
+    dev(x) = DiffEqGPU.adapt(backend, x)
+    lud = dev(lu)
+    st_d = dev(status)
+    Wl, scl = dev(zeros(1, lu.nslot)), dev(zeros(1, N))
+    DiffEqGPU.lane_sparse_factor_kernel(backend)(
+        Wl, scl, dev([1.0]), st_d, dev(Jv), dev(zeros(N)), dev([1.0]), 1.0, lud; ndrange = 1
+    )
+    xl = dev(reshape(copy(b), N, 1))
+    DiffEqGPU.lane_sparse_solve_kernel(backend)(xl, scl, Wl, st_d, lud; ndrange = 1)
+    @test vec(Array(xl)) ≈ W \ b rtol = 1.0e-12
+    devslot(A) = PermutedDimsArray(dev(Matrix(permutedims(A))), (2, 1))
+    Wcd, sccd = devslot(zeros(1, lu.nslot)), devslot(zeros(1, N))
+    DiffEqGPU.lane_sparse_factor_coop_kernel(backend)(
+        Wcd, sccd, dev([1.0]), st_d, devslot(Jv), dev(zeros(N)), dev([1.0]), 1.0, lud, 1;
+        ndrange = (4, 2), workgroupsize = (4, 2)
+    )
+    xcd = dev(reshape(copy(b), N, 1))
+    DiffEqGPU.lane_sparse_solve_coop_kernel(backend)(
+        xcd, sccd, Wcd, st_d, lud, 1; ndrange = (4, 2), workgroupsize = (4, 2)
+    )
+    @test vec(Array(xcd)) ≈ W \ b rtol = 1.0e-12
     # The pivot check: with the order fixed to the identity, W = [1 1; 1 1 + 1e-12] keeps only
     # 1e-12 of its second pivot (σ = 1e-12), so the lane stops; a well-conditioned W does not.
     Pg = sparse(trues(2, 2))
