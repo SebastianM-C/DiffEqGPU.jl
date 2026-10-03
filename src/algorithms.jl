@@ -255,7 +255,11 @@ factorization of the solve; this works when the large entries stay where they ar
 models whose algebraic equations keep their structure, and makes the factorizations and
 solves a fraction of dense LU's. The pattern must contain every entry the right-hand side can
 make nonzero: with the coloring, a missing entry also corrupts other stored entries. Each
-trajectory's factorization and solves run on a group of threads.
+trajectory's factorization and solves run on a group of threads. A trajectory whose fixed pivot
+order loses a pivot to cancellation during the elimination (see `DiffEqGPU.lane_pivot_status`)
+switches to a pivoted dense LU, the factorization a solve of that trajectory on its own uses,
+for the rest of its solve; it stops with `ReturnCode.InternalLinearSolveFailed` only if that is
+singular too.
 
 # Examples
 

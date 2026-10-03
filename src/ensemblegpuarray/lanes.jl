@@ -241,6 +241,8 @@ struct LaneStepper{T, Tt, M, S, V, I8, I32, BV, TB, CO, F, P, CB}
     lu::Any         # `LaneSparseLU` once the pivot order is chosen, or `nothing`
     lu_scratch::Any # B × N scratch of the sparse factorization and solves
     pivot_min::Any  # B smallest pivot ratio of the sparse factorizations so far
+    dense_lane::Any # B: the lane's W is factorized densely (`LaneDenseFallback`), or `nothing`
+    dense_fallback::Any
     norm_weights::Any # N weights of a `ComponentNorm` (1 kept, 0 not), or `nothing`
     nkeep::Int      # the number of components in the error norm
     backend::Any
@@ -918,6 +920,8 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
         maxiters, f, p, callbacks, sparsity, nothing,
         pattern === nothing ? nothing : _lane_values(u0, T, B, N),
         pattern === nothing ? nothing : lv(one(T), T),
+        pattern === nothing ? nothing : lv(false, Bool),
+        pattern === nothing ? nothing : LaneDenseFallback(),
         norm_weights, nkeep,
         backend
     )
@@ -950,11 +954,17 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
     end
 
     status = Array(st.status)
+    if st.dense_lane !== nothing
+        ndense = count(Array(st.dense_lane))
+        ndense > 0 &&
+            @debug "$ndense of $B trajectories switched to the dense LU: their static-pivot factorization failed the pivot check"
+    end
     nsaved = Array(st.save_idx) .- 1
     return (;
         savet, saves = Array(st.saves), nsaved, status,
         naccept = Array(st.naccept), nreject = Array(st.nreject), p = st.p,
         pivot_min = st.pivot_min === nothing ? nothing : Array(st.pivot_min),
+        dense_lane = st.dense_lane === nothing ? nothing : Array(st.dense_lane),
     )
 end
 
@@ -1053,9 +1063,11 @@ function _lane_factorize!(st, wgs)
     else
         S, L, Bp = _lane_coop_shape(LANE_SPARSE_FACTOR_THREADS, B)
         lane_sparse_factor_coop_kernel(backend)(
-            st.W, st.lu_scratch, st.pivot_min, st.status, st.J, st.mass_diag, st.dt,
-            st.tab.gamma, st.lu, B; ndrange = (S, Bp), workgroupsize = (S, L)
+            st.W, st.lu_scratch, st.pivot_min, st.dense_lane, st.status, st.J, st.mass_diag,
+            st.dt, st.tab.gamma, st.lu, B; ndrange = (S, Bp), workgroupsize = (S, L)
         )
+        # Lanes whose static-pivot factorization tripped the pivot check, now or earlier.
+        _lane_dense_factorize!(st)
     end
     return nothing
 end
@@ -1068,8 +1080,10 @@ function _lane_ldiv!(st, wgs)
     else
         S, L, Bp = _lane_coop_shape(_lane_sparse_solve_threads(B), B)
         lane_sparse_solve_coop_kernel(st.backend)(
-            st.tmp, st.lu_scratch, st.W, st.status, st.lu, B; ndrange = (S, Bp), workgroupsize = (S, L)
+            st.tmp, st.lu_scratch, st.W, st.status, st.dense_lane, st.lu, B;
+            ndrange = (S, Bp), workgroupsize = (S, L)
         )
+        _lane_dense_ldiv!(st, st.tmp)
     end
     return nothing
 end

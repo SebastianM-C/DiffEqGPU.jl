@@ -1,4 +1,4 @@
-using DiffEqGPU, LinearAlgebra, SparseArrays, Test
+using DiffEqGPU, LinearAlgebra, SparseArrays, Test, Logging
 using OrdinaryDiffEqRosenbrock: Rodas5P, Rosenbrock23
 using DiffEqCallbacks: PeriodicCallback
 import SciMLBase
@@ -239,24 +239,25 @@ end
     Wv = zeros(1, lu.nslot)
     scratch = zeros(1, N)
     status = [DiffEqGPU.LANE_ACTIVE]
+    dense = [false]
     DiffEqGPU.lane_sparse_factor_kernel(cpu)(
-        Wv, scratch, [1.0], status, Jv, zeros(N), [1.0], 1.0, lu; ndrange = 1
+        Wv, scratch, [1.0], dense, status, Jv, zeros(N), [1.0], 1.0, lu; ndrange = 1
     )
     b = [cos(3k) for k in 1:N]
     x = reshape(copy(b), N, 1)
-    DiffEqGPU.lane_sparse_solve_kernel(cpu)(x, scratch, Wv, status, lu; ndrange = 1)
+    DiffEqGPU.lane_sparse_solve_kernel(cpu)(x, scratch, Wv, status, dense, lu; ndrange = 1)
     @test vec(x) ≈ W \ b rtol = 1.0e-12
     # The cooperative kernels (4 threads per lane, 2 lanes per workgroup: one padded lane),
     # with the values stored slot-major.
     slotmajor(A) = PermutedDimsArray(Matrix(permutedims(A)), (2, 1))
     Wc, scratch_c = slotmajor(zeros(1, lu.nslot)), slotmajor(zeros(1, N))
     DiffEqGPU.lane_sparse_factor_coop_kernel(cpu)(
-        Wc, scratch_c, [1.0], status, slotmajor(Jv), zeros(N), [1.0], 1.0, lu, 1;
+        Wc, scratch_c, [1.0], dense, status, slotmajor(Jv), zeros(N), [1.0], 1.0, lu, 1;
         ndrange = (4, 2), workgroupsize = (4, 2)
     )
     xc = reshape(copy(b), N, 1)
     DiffEqGPU.lane_sparse_solve_coop_kernel(cpu)(
-        xc, scratch_c, Wc, status, lu, 1; ndrange = (4, 2), workgroupsize = (4, 2)
+        xc, scratch_c, Wc, status, dense, lu, 1; ndrange = (4, 2), workgroupsize = (4, 2)
     )
     @test vec(xc) ≈ W \ b rtol = 1.0e-12
     # Both kernel shapes on the test backend (the solves with fewer than 8192 trajectories use
@@ -264,37 +265,41 @@ end
     dev(x) = DiffEqGPU.adapt(backend, x)
     lud = dev(lu)
     st_d = dev(status)
+    dense_d = dev(dense)
     Wl, scl = dev(zeros(1, lu.nslot)), dev(zeros(1, N))
     DiffEqGPU.lane_sparse_factor_kernel(backend)(
-        Wl, scl, dev([1.0]), st_d, dev(Jv), dev(zeros(N)), dev([1.0]), 1.0, lud; ndrange = 1
+        Wl, scl, dev([1.0]), dense_d, st_d, dev(Jv), dev(zeros(N)), dev([1.0]), 1.0, lud; ndrange = 1
     )
     xl = dev(reshape(copy(b), N, 1))
-    DiffEqGPU.lane_sparse_solve_kernel(backend)(xl, scl, Wl, st_d, lud; ndrange = 1)
+    DiffEqGPU.lane_sparse_solve_kernel(backend)(xl, scl, Wl, st_d, dense_d, lud; ndrange = 1)
     @test vec(Array(xl)) ≈ W \ b rtol = 1.0e-12
     devslot(A) = PermutedDimsArray(dev(Matrix(permutedims(A))), (2, 1))
     Wcd, sccd = devslot(zeros(1, lu.nslot)), devslot(zeros(1, N))
     DiffEqGPU.lane_sparse_factor_coop_kernel(backend)(
-        Wcd, sccd, dev([1.0]), st_d, devslot(Jv), dev(zeros(N)), dev([1.0]), 1.0, lud, 1;
+        Wcd, sccd, dev([1.0]), dense_d, st_d, devslot(Jv), dev(zeros(N)), dev([1.0]), 1.0, lud, 1;
         ndrange = (4, 2), workgroupsize = (4, 2)
     )
     xcd = dev(reshape(copy(b), N, 1))
     DiffEqGPU.lane_sparse_solve_coop_kernel(backend)(
-        xcd, sccd, Wcd, st_d, lud, 1; ndrange = (4, 2), workgroupsize = (4, 2)
+        xcd, sccd, Wcd, st_d, dense_d, lud, 1; ndrange = (4, 2), workgroupsize = (4, 2)
     )
     @test vec(Array(xcd)) ≈ W \ b rtol = 1.0e-12
     # The pivot check: with the order fixed to the identity, W = [1 1; 1 1 + 1e-12] keeps only
-    # 1e-12 of its second pivot (σ = 1e-12), so the lane stops; a well-conditioned W does not.
+    # 1e-12 of its second pivot (σ = 1e-12), so the lane switches to the dense fallback; a
+    # well-conditioned W does not.
     Pg = sparse(trues(2, 2))
     Pgb = DiffEqGPU._lane_sparsity_pattern(Pg, 2)
     lug = DiffEqGPU._lane_sparse_lu(Matrix(Pgb), Pgb, [1, 2], [1, 2])
-    for (w22, expected) in ((1 + 1.0e-12, DiffEqGPU.LANE_PIVOT), (3.0, DiffEqGPU.LANE_ACTIVE))
+    for (w22, expected) in ((1 + 1.0e-12, true), (3.0, false))
         st = [DiffEqGPU.LANE_ACTIVE]
+        dn = [false]
         pmin = [1.0]
         DiffEqGPU.lane_sparse_factor_kernel(cpu)(
-            zeros(1, lug.nslot), zeros(1, 2), pmin, st, [1.0 1.0 1.0 w22], zeros(2), [1.0], 1.0, lug;
+            zeros(1, lug.nslot), zeros(1, 2), pmin, dn, st, [1.0 1.0 1.0 w22], zeros(2), [1.0], 1.0, lug;
             ndrange = 1
         )
-        @test only(st) == expected
+        @test only(dn) == expected
+        @test only(st) == DiffEqGPU.LANE_ACTIVE
         @test only(pmin) ≈ min(1.0, abs(w22 - 1) / w22) rtol = 1.0e-3
     end
     @test DiffEqGPU.lane_pivot_status(NaN) == DiffEqGPU.LANE_PIVOT
@@ -315,6 +320,48 @@ end
     P0 = copy(P)
     P0[:, 1] .= false
     @test !DiffEqGPU._lane_structurally_nonsingular(P0)
+end
+
+# An algebraic block [1 1 0; 1 1+δ 1; 0 1 1] (determinant δ - 1: well conditioned) whose δ decays
+# from 0.5 to 1e-12: the static pivot order chosen at t = 0 eliminates it in an order whose
+# second pivot cancels to δ, so the pivot check trips (central differences keep the
+# Jacobian's noise below δ's scale) and the trajectories continue with the pivoted dense LU.
+trip_δ(t) = 1.0e-12 + 0.5 * exp(-20t)
+function trip!(du, u, p, t)
+    x, z1, z2, z3 = u
+    du[1] = -p[1] * x + z1
+    du[2] = z1 + z2 - 1
+    du[3] = z1 + (1 + trip_δ(t)) * z2 + z3 - 2
+    du[4] = z2 + z3 - 3
+    return nothing
+end
+
+@testset "Sparse jac_prototype: dense LU fallback when the pivot check trips" begin
+    P = sparse([1 1 0 0; 0 1 1 0; 0 1 1 1; 0 0 1 1.0])
+    u0 = [1.0; [1 1 0; 1 1.5 1; 0 1 1.0] \ [1.0, 2.0, 3.0]]
+    trip_problem(jac_prototype) = ODEProblem(
+        ODEFunction(trip!; mass_matrix = Diagonal([1.0, 0, 0, 0]), jac_prototype), u0,
+        (0.0, 2.0), [1.0]
+    )
+    ens(prob) = EnsembleProblem(prob; prob_func = (p, c) -> remake(p; p = [1.0 + 0.1c.sim_id]), safetycopy = false)
+    a = Rodas5P(autodiff = AutoFiniteDiff(fdtype = Val(:central)))
+    kwargs = (; abstol = 1.0e-8, reltol = 1.0e-6, saveat = 0.25)
+    sparse_sol = @test_logs (:debug, r"2 of 2 trajectories switched to the dense LU") min_level = Logging.Debug match_mode = :any solve(
+        ens(trip_problem(P)), a, lanes(); trajectories = 2, kwargs...
+    )
+    dense_sol = solve(ens(trip_problem(nothing)), a, lanes(); trajectories = 2, kwargs...)
+    for i in 1:2
+        @test sparse_sol.u[i].retcode == SciMLBase.ReturnCode.Success
+        @test abs(sparse_sol.u[i].stats.naccept - dense_sol.u[i].stats.naccept) <= 1
+        @test max_state_error(sparse_sol.u[i], dense_sol.u[i]) < 1.0e-8
+    end
+    # A lane whose dense factorization is singular too stops.
+    status = [DiffEqGPU.LANE_ACTIVE, DiffEqGPU.LANE_ACTIVE]
+    Wd = zeros(2, 2, 2)
+    Wd[:, :, 1] = [1.0 0; 0 1]
+    Wd[:, :, 2] = [1.0 0; 0 0]
+    DiffEqGPU.lane_dense_check_kernel(DiffEqGPU.KernelAbstractions.CPU())(status, Wd, Int32[1, 2]; ndrange = 2)
+    @test status == [DiffEqGPU.LANE_ACTIVE, DiffEqGPU.LANE_PIVOT]
 end
 
 @testset "ComponentNorm: error control of some components" begin

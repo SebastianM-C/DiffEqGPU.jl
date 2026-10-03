@@ -64,8 +64,10 @@ The status of a lane after its iteration matrix W has been factorized with the f
 order, from `σ = min_k |U[k, k]| / |W[k, k]|`: how much the pivots shrank during the
 elimination (`σ = 1` when no pivot lost magnitude; scale-invariant, unlike a ratio to the
 column maximum or the size of the multipliers). Returns `LANE_ACTIVE` to continue with the
-factors, or a final status (`LANE_PIVOT`, reported as `ReturnCode.InternalLinearSolveFailed`)
-to stop the lane. A NaN pivot makes `σ` NaN
+factors, or `LANE_PIVOT` to factorize the lane's W with a pivoted dense LU from then on (the
+factorization a solve of the trajectory on its own uses). A lane stops with `LANE_PIVOT`,
+reported as `ReturnCode.InternalLinearSolveFailed`, only when that dense factorization is
+singular too. A NaN pivot makes `σ` NaN
 (compare with `!(σ >= threshold)` to treat it as failing); an exactly zero or non-finite
 pivot also makes the step's error estimate non-finite, which the controller turns into
 `LANE_UNSTABLE`. `σ` measures the cancellation during the elimination only: a pivot that is
@@ -442,10 +444,11 @@ end
 # list. `d0` keeps the diagonal of the permuted W before elimination, for the pivot
 # check; `pivot_min` keeps, per lane, the smallest |U[k, k]| / |W[k, k]| seen in the solve.
 @kernel function lane_sparse_factor_kernel(
-        Wv, d0, pivot_min, status, @Const(Jv), @Const(mass_diag), @Const(dt), @Const(gamma), @Const(lu)
+        Wv, d0, pivot_min, dense, @Const(status), @Const(Jv), @Const(mass_diag), @Const(dt),
+        @Const(gamma), @Const(lu)
     )
     i = @index(Global, Linear)
-    @inbounds if status[i] == LANE_ACTIVE
+    @inbounds if status[i] == LANE_ACTIVE && !dense[i]
         T = eltype(Wv)
         N = length(lu.piv)
         for s in 1:lu.nslot
@@ -479,15 +482,15 @@ end
             end
         end
         pivot_min[i] = min(pivot_min[i], σ)
-        status[i] = lane_pivot_status(σ)
+        lane_pivot_status(σ) == LANE_ACTIVE || (dense[i] = true)
     end
 end
 
 # x = W \ x for every active lane, with the factors of `lane_sparse_factor_kernel`; `y` is
 # B × N scratch. Forward and back substitution by columns (as the cooperative kernel).
-@kernel function lane_sparse_solve_kernel(x, y, @Const(Wv), @Const(status), @Const(lu))
+@kernel function lane_sparse_solve_kernel(x, y, @Const(Wv), @Const(status), @Const(dense), @Const(lu))
     i = @index(Global, Linear)
-    @inbounds if status[i] == LANE_ACTIVE
+    @inbounds if status[i] == LANE_ACTIVE && !dense[i]
         N = length(lu.piv)
         for r in 1:N
             y[i, r] = x[lu.rowo[r], i]
@@ -524,29 +527,29 @@ end
 # The lane of a cooperative thread exists (the launch is padded) and is active; evaluated in
 # every segment between barriers, as a value kept across `@synchronize` would have to be
 # `@private` on the CPU backend.
-@inline _coop_active(i, B, status) = i <= B && @inbounds(status[i] == LANE_ACTIVE)
+@inline _coop_active(i, B, status, dense) = i <= B && @inbounds(status[i] == LANE_ACTIVE && !dense[i])
 
 @kernel function lane_sparse_factor_coop_kernel(
-        Wv, d0, pivot_min, status, @Const(Jv), @Const(mass_diag), @Const(dt), @Const(gamma),
-        @Const(lu), @Const(B)
+        Wv, d0, pivot_min, dense, @Const(status), @Const(Jv), @Const(mass_diag), @Const(dt),
+        @Const(gamma), @Const(lu), @Const(B)
     )
     s, i = @index(Global, NTuple)
     @uniform S = @groupsize()[1]
     @uniform N = length(lu.piv)
     @uniform T = eltype(Wv)
-    @inbounds if _coop_active(i, B, status)
+    @inbounds if _coop_active(i, B, status, dense)
         for q in s:S:(lu.nslot)
             Wv[i, q] = zero(T)
         end
     end
     @synchronize
-    @inbounds if _coop_active(i, B, status)
+    @inbounds if _coop_active(i, B, status, dense)
         for e in s:S:length(lu.jslot)
             Wv[i, lu.jslot[e]] = Jv[i, e]
         end
     end
     @synchronize
-    @inbounds if _coop_active(i, B, status)
+    @inbounds if _coop_active(i, B, status, dense)
         invh = inv(dt[i] * gamma)
         for k in s:S:N
             q = lu.mslot[k]
@@ -556,13 +559,13 @@ end
         end
     end
     @synchronize
-    @inbounds if _coop_active(i, B, status)
+    @inbounds if _coop_active(i, B, status, dense)
         for k in s:S:N
             d0[i, k] = Wv[i, lu.piv[k]]
         end
     end
     for k in 1:N
-        @inbounds if _coop_active(i, B, status)
+        @inbounds if _coop_active(i, B, status, dense)
             ip = inv(Wv[i, lu.piv[k]])
             for q in (lu.fmaptr[k] + s - 1):S:(lu.fmaptr[k + 1] - 1)
                 t = lu.fma_t[q]
@@ -577,7 +580,7 @@ end
         end
         @synchronize
     end
-    @inbounds if _coop_active(i, B, status)
+    @inbounds if _coop_active(i, B, status, dense)
         ip = inv(Wv[i, lu.piv[N]])
         for q in (lu.divptr[N] + s - 1):S:(lu.divptr[N + 1] - 1)
             Wv[i, lu.div_t[q]] *= ip
@@ -590,23 +593,23 @@ end
                 σ = min(σ, iszero(a) ? (iszero(pk) ? zero(T) : one(T)) : abs(pk) / a)
             end
             pivot_min[i] = min(pivot_min[i], σ)
-            status[i] = lane_pivot_status(σ)
+            lane_pivot_status(σ) == LANE_ACTIVE || (dense[i] = true)
         end
     end
 end
 
-@kernel function lane_sparse_solve_coop_kernel(x, y, @Const(Wv), @Const(status), @Const(lu), @Const(B))
+@kernel function lane_sparse_solve_coop_kernel(x, y, @Const(Wv), @Const(status), @Const(dense), @Const(lu), @Const(B))
     s, i = @index(Global, NTuple)
     @uniform S = @groupsize()[1]
     @uniform N = length(lu.piv)
-    @inbounds if _coop_active(i, B, status)
+    @inbounds if _coop_active(i, B, status, dense)
         for r in s:S:N
             y[i, r] = x[lu.rowo[r], i]
         end
     end
     @synchronize
     for k in 1:N
-        @inbounds if _coop_active(i, B, status)
+        @inbounds if _coop_active(i, B, status, dense)
             yk = y[i, k]
             for q in (lu.Lptr[k] + s - 1):S:(lu.Lptr[k + 1] - 1)
                 r = lu.Lrow[q]
@@ -617,7 +620,7 @@ end
     end
     # y[k] keeps the value before the division by the pivot (every thread divides it itself).
     for k in N:-1:1
-        @inbounds if _coop_active(i, B, status)
+        @inbounds if _coop_active(i, B, status, dense)
             yk = y[i, k] / Wv[i, lu.piv[k]]
             for q in (lu.Uptr[k] + s - 1):S:(lu.Uptr[k + 1] - 1)
                 r = lu.Urow[q]
@@ -626,11 +629,113 @@ end
         end
         @synchronize
     end
-    @inbounds if _coop_active(i, B, status)
+    @inbounds if _coop_active(i, B, status, dense)
         for r in s:S:N
             x[lu.colo[r], i] = y[i, r] / Wv[i, lu.piv[r]]
         end
     end
+end
+
+# ---------------------------------------------------------------------------------------
+# Dense fallback: the lanes whose static-pivot factorization tripped `lane_pivot_status`
+# (`dense[i]`) are factorized with the batched pivoted dense LU from then on, gathered into a
+# K-lane batch each step.
+
+mutable struct LaneDenseFallback
+    lanes::Any  # K lane indices (device, Int32)
+    W::Any      # N × N × K iteration matrices, LU-factored in place
+    ipiv::Any
+    x::Any      # N × K right-hand sides and solutions
+    K::Int
+end
+LaneDenseFallback() = LaneDenseFallback(nothing, nothing, nothing, nothing, 0)
+
+# W = J - M / (dt γ) of lane `lanes[k]` from its stored Jacobian entries.
+@kernel function lane_dense_w_kernel(Wd, @Const(lanes), @Const(Jv), @Const(sp), @Const(mass_diag), @Const(dt), @Const(gamma))
+    k = @index(Global, Linear)
+    @inbounds begin
+        i = lanes[k]
+        N = size(Wd, 1)
+        T = eltype(Wd)
+        for c in 1:N, r in 1:N
+            Wd[r, c, k] = zero(T)
+        end
+        for c in 1:N, e in sp.colptr[c]:(sp.colptr[c + 1] - 1)
+            Wd[sp.rowval[e], c, k] = Jv[i, e]
+        end
+        invh = inv(dt[i] * gamma)
+        for c in 1:N
+            Wd[c, c, k] -= _mass_diagonal(mass_diag, c, Wd) * invh
+        end
+    end
+end
+
+# A lane whose dense factorization has a zero or non-finite pivot stops (`LANE_PIVOT`).
+@kernel function lane_dense_check_kernel(status, @Const(Wd), @Const(lanes))
+    k = @index(Global, Linear)
+    @inbounds begin
+        ok = true
+        for c in 1:size(Wd, 1)
+            d = Wd[c, c, k]
+            ok &= isfinite(d) & !iszero(d)
+        end
+        ok || (status[lanes[k]] = LANE_PIVOT)
+    end
+end
+
+@kernel function lane_gather_kernel(xd, @Const(x), @Const(lanes))
+    r, k = @index(Global, NTuple)
+    @inbounds xd[r, k] = x[r, lanes[k]]
+end
+
+@kernel function lane_scatter_kernel(x, @Const(xd), @Const(lanes), @Const(status))
+    r, k = @index(Global, NTuple)
+    @inbounds begin
+        i = lanes[k]
+        status[i] == LANE_ACTIVE && (x[r, i] = xd[r, k])
+    end
+end
+
+# Gather the active dense lanes and factorize their W; returns the number of them.
+function _lane_dense_factorize!(st)
+    fb = st.dense_fallback
+    mask = Array(st.dense_lane) .& (Array(st.status) .== LANE_ACTIVE)
+    K = count(mask)
+    fb.K = K
+    K == 0 && return 0
+    backend = st.backend
+    N = size(st.u, 1)
+    T = eltype(st.u)
+    if fb.W === nothing || size(fb.W, 3) != K
+        fb.W = fill!(similar(st.u, T, N, N, K), zero(T))
+        fb.ipiv = lu_pivots(fb.W)
+        fb.x = fill!(similar(st.u, T, N, K), zero(T))
+        fb.lanes = fill!(similar(st.u, Int32, K), Int32(0))
+    end
+    copyto!(fb.lanes, Int32.(findall(mask)))
+    wgs = workgroupsize(backend, K)
+    lane_dense_w_kernel(backend)(
+        fb.W, fb.lanes, st.J, st.sparsity, st.mass_diag, st.dt, st.tab.gamma;
+        ndrange = K, workgroupsize = wgs
+    )
+    batched_lufact!(backend, fb.W, fb.ipiv)
+    lane_dense_check_kernel(backend)(st.status, fb.W, fb.lanes; ndrange = K, workgroupsize = wgs)
+    return K
+end
+
+# x = W \ x for the dense lanes gathered by `_lane_dense_factorize!`.
+function _lane_dense_ldiv!(st, x)
+    fb = st.dense_fallback
+    K = fb.K
+    K == 0 && return nothing
+    backend = st.backend
+    N = size(st.u, 1)
+    nk = (N, K)
+    wg = (min(N, 32), max(1, min(K, 256 ÷ min(N, 32))))
+    lane_gather_kernel(backend)(fb.x, x, fb.lanes; ndrange = nk, workgroupsize = wg)
+    batched_ldiv!(backend, fb.W, fb.x, fb.ipiv, N, K)
+    lane_scatter_kernel(backend)(x, fb.x, fb.lanes, st.status; ndrange = nk, workgroupsize = wg)
+    return nothing
 end
 
 # Choose the pivot order from the lanes' current Jacobians `st.J` and step sizes, and
