@@ -241,6 +241,7 @@ struct LaneStepper{T, Tt, M, S, V, I8, I32, BV, TB, CO, F, P, CB}
     lu::Any         # `LaneSparseLU` once the pivot order is chosen, or `nothing`
     lu_scratch::Any # B × N scratch of the sparse factorization and solves
     pivot_min::Any  # B smallest pivot ratio of the sparse factorizations so far
+    pivot_threshold::Float64 # `lane_pivot_status`
     dense_lane::Any # B: the lane's W is factorized densely (`LaneDenseFallback`), or `nothing`
     dense_fallback::Any
     norm_weights::Any # N weights of a `ComponentNorm` (1 kept, 0 not), or `nothing`
@@ -938,7 +939,7 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
         LaneRodasTableau(T), LaneControllerOptions(T), abstol, reltol, dtmin, dtmax,
         maxiters, f, p, callbacks, sparsity, nothing,
         pattern === nothing ? nothing : _lane_values(u0, T, B, N),
-        pattern === nothing ? nothing : lv(one(T), T),
+        pattern === nothing ? nothing : lv(one(T), T), ensemblealg.pivot_threshold,
         pattern === nothing ? nothing : lv(false, Bool),
         pattern === nothing ? nothing : LaneDenseFallback(u0, T, N),
         norm_weights, nkeep,
@@ -1083,7 +1084,8 @@ function _lane_factorize!(st, wgs)
         S, L, Bp = _lane_coop_shape(LANE_SPARSE_FACTOR_THREADS, B)
         lane_sparse_factor_coop_kernel(backend)(
             st.W, st.lu_scratch, st.pivot_min, st.dense_lane, st.status, st.J, st.mass_diag,
-            st.dt, st.tab.gamma, st.lu, B; ndrange = (S, Bp), workgroupsize = (S, L)
+            st.dt, st.tab.gamma, eltype(st.J)(st.pivot_threshold), st.lu, B;
+            ndrange = (S, Bp), workgroupsize = (S, L)
         )
         # Lanes whose static-pivot factorization tripped the pivot check, now or earlier.
         _lane_dense_factorize!(st)

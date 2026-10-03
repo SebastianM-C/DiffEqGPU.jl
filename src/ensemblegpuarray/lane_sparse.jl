@@ -57,32 +57,31 @@ function Adapt.adapt_structure(to, lu::LaneSparseLU)
     )
 end
 
+# The default `pivot_threshold` of `EnsembleGPUArray`. Finite-difference Jacobians are accurate
+# to about sqrt(eps) ≈ 1.5e-8 (forward differences), so a cancelling pivot shows up as σ near
+# that noise rather than below it. On a 190-state DAE's parameter grid σ went down to
+# 1.8e-7 over 3 s and to 2.5e-9 over 17 s, and the fixed order still solved those W as
+# accurately as the dense LU: models whose σ stays well above the noise can lower it.
+const LANE_PIVOT_THRESHOLD = 1.0e-7
+
 """
-    lane_pivot_status(σ)
+    lane_pivot_status(σ, threshold)
 
 The status of a lane after its iteration matrix W has been factorized with the fixed pivot
 order, from `σ = min_k |U[k, k]| / |W[k, k]|`: how much the pivots shrank during the
 elimination (`σ = 1` when no pivot lost magnitude; scale-invariant, unlike a ratio to the
 column maximum or the size of the multipliers). Returns `LANE_ACTIVE` to continue with the
-factors, or `LANE_PIVOT` to factorize the lane's W with a pivoted dense LU from then on (the
-factorization a solve of the trajectory on its own uses). A lane stops with `LANE_PIVOT`,
-reported as `ReturnCode.InternalLinearSolveFailed`, only when that dense factorization is
-singular too. A NaN pivot makes `σ` NaN
-(compare with `!(σ >= threshold)` to treat it as failing); an exactly zero or non-finite
-pivot also makes the step's error estimate non-finite, which the controller turns into
-`LANE_UNSTABLE`. `σ` measures the cancellation during the elimination only: a pivot that is
-already small relative to its column in the current W (the order was chosen at the first
+factors when `σ >= threshold` (`EnsembleGPUArray`'s `pivot_threshold`), or `LANE_PIVOT` to
+factorize the lane's W with a pivoted dense LU from then on (the factorization a solve of the
+trajectory on its own uses). A lane stops with `LANE_PIVOT`, reported as
+`ReturnCode.InternalLinearSolveFailed`, only when that dense factorization is singular too. A
+NaN pivot makes `σ` NaN, which fails the check for every threshold; an exactly zero or
+non-finite pivot also makes the step's error estimate non-finite, which the controller turns
+into `LANE_UNSTABLE`. `σ` measures the cancellation during the elimination only: a pivot that
+is already small relative to its column in the current W (the order was chosen at the first
 step's `dt`) keeps `σ = 1`.
 """
-@inline function lane_pivot_status(σ)
-    # Finite-difference Jacobians are accurate to about sqrt(eps) ≈ 1.5e-8 (forward
-    # differences), so a cancelling pivot shows up as σ near that noise rather than below it.
-    # On a 190-state DAE's parameter grid, σ went down to 1.8e-7 over the steps, and
-    # the fixed order solved those W as accurately as the dense LU (the two differed by much
-    # less than a one-ulp change of the initial state moves the trajectories); 1e-7 keeps
-    # them on the fixed order while staying above the noise.
-    return !(σ >= 1.0e-7) ? LANE_PIVOT : LANE_ACTIVE
-end
+@inline lane_pivot_status(σ, threshold) = !(σ >= threshold) ? LANE_PIVOT : LANE_ACTIVE
 
 _lane_sparse(prototype) = prototype isa SparseMatrixCSC
 
@@ -436,7 +435,7 @@ end
 # check; `pivot_min` keeps, per lane, the smallest |U[k, k]| / |W[k, k]| seen in the solve.
 @kernel function lane_sparse_factor_kernel(
         Wv, d0, pivot_min, dense, @Const(status), @Const(Jv), @Const(mass_diag), @Const(dt),
-        @Const(gamma), @Const(lu)
+        @Const(gamma), @Const(pivot_threshold), @Const(lu)
     )
     i = @index(Global, Linear)
     @inbounds if status[i] == LANE_ACTIVE && !dense[i]
@@ -473,7 +472,7 @@ end
             end
         end
         pivot_min[i] = min(pivot_min[i], σ)
-        lane_pivot_status(σ) == LANE_ACTIVE || (dense[i] = true)
+        lane_pivot_status(σ, pivot_threshold) == LANE_ACTIVE || (dense[i] = true)
     end
 end
 
@@ -522,7 +521,7 @@ end
 
 @kernel function lane_sparse_factor_coop_kernel(
         Wv, d0, pivot_min, dense, @Const(status), @Const(Jv), @Const(mass_diag), @Const(dt),
-        @Const(gamma), @Const(lu), @Const(B)
+        @Const(gamma), @Const(pivot_threshold), @Const(lu), @Const(B)
     )
     s, i = @index(Global, NTuple)
     @uniform S = @groupsize()[1]
@@ -584,7 +583,7 @@ end
                 σ = min(σ, iszero(a) ? (iszero(pk) ? zero(T) : one(T)) : abs(pk) / a)
             end
             pivot_min[i] = min(pivot_min[i], σ)
-            lane_pivot_status(σ) == LANE_ACTIVE || (dense[i] = true)
+            lane_pivot_status(σ, pivot_threshold) == LANE_ACTIVE || (dense[i] = true)
         end
     end
 end

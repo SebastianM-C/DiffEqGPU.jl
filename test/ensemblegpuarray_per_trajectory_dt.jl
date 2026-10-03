@@ -263,7 +263,7 @@ end
     status = [DiffEqGPU.LANE_ACTIVE]
     dense = [false]
     DiffEqGPU.lane_sparse_factor_kernel(cpu)(
-        Wv, scratch, [1.0], dense, status, Jv, zeros(N), [1.0], 1.0, lu; ndrange = 1
+        Wv, scratch, [1.0], dense, status, Jv, zeros(N), [1.0], 1.0, 1.0e-7, lu; ndrange = 1
     )
     b = [cos(3k) for k in 1:N]
     x = reshape(copy(b), N, 1)
@@ -274,7 +274,7 @@ end
     slotmajor(A) = PermutedDimsArray(Matrix(permutedims(A)), (2, 1))
     Wc, scratch_c = slotmajor(zeros(1, lu.nslot)), slotmajor(zeros(1, N))
     DiffEqGPU.lane_sparse_factor_coop_kernel(cpu)(
-        Wc, scratch_c, [1.0], dense, status, slotmajor(Jv), zeros(N), [1.0], 1.0, lu, 1;
+        Wc, scratch_c, [1.0], dense, status, slotmajor(Jv), zeros(N), [1.0], 1.0, 1.0e-7, lu, 1;
         ndrange = (4, 2), workgroupsize = (4, 2)
     )
     xc = reshape(copy(b), N, 1)
@@ -302,7 +302,7 @@ end
     dense_d = dev(dense)
     Wl, scl = dev(zeros(1, lu.nslot)), dev(zeros(1, N))
     DiffEqGPU.lane_sparse_factor_kernel(backend)(
-        Wl, scl, dev([1.0]), dense_d, st_d, dev(Jv), dev(zeros(N)), dev([1.0]), 1.0, lud; ndrange = 1
+        Wl, scl, dev([1.0]), dense_d, st_d, dev(Jv), dev(zeros(N)), dev([1.0]), 1.0, 1.0e-7, lud; ndrange = 1
     )
     xl = dev(reshape(copy(b), N, 1))
     DiffEqGPU.lane_sparse_solve_kernel(backend)(xl, scl, Wl, st_d, dense_d, lud; ndrange = 1)
@@ -310,7 +310,7 @@ end
     devslot(A) = PermutedDimsArray(dev(Matrix(permutedims(A))), (2, 1))
     Wcd, sccd = devslot(zeros(1, lu.nslot)), devslot(zeros(1, N))
     DiffEqGPU.lane_sparse_factor_coop_kernel(backend)(
-        Wcd, sccd, dev([1.0]), dense_d, st_d, devslot(Jv), dev(zeros(N)), dev([1.0]), 1.0, lud, 1;
+        Wcd, sccd, dev([1.0]), dense_d, st_d, devslot(Jv), dev(zeros(N)), dev([1.0]), 1.0, 1.0e-7, lud, 1;
         ndrange = (4, 2), workgroupsize = (4, 2)
     )
     xcd = dev(reshape(copy(b), N, 1))
@@ -330,19 +330,19 @@ end
     Pg = sparse(trues(2, 2))
     Pgb = DiffEqGPU._lane_sparsity_pattern(Pg, 2)
     lug = DiffEqGPU._lane_sparse_lu(Matrix(Pgb), Pgb, [1, 2], [1, 2])
-    for (w22, expected) in ((1 + 1.0e-12, true), (3.0, false))
+    for (w22, threshold, expected) in ((1 + 1.0e-12, 1.0e-7, true), (3.0, 1.0e-7, false), (1 + 1.0e-12, 1.0e-13, false))
         st = [DiffEqGPU.LANE_ACTIVE]
         dn = [false]
         pmin = [1.0]
         DiffEqGPU.lane_sparse_factor_kernel(cpu)(
-            zeros(1, lug.nslot), zeros(1, 2), pmin, dn, st, [1.0 1.0 1.0 w22], zeros(2), [1.0], 1.0, lug;
-            ndrange = 1
+            zeros(1, lug.nslot), zeros(1, 2), pmin, dn, st, [1.0 1.0 1.0 w22], zeros(2), [1.0], 1.0,
+            threshold, lug; ndrange = 1
         )
         @test only(dn) == expected
         @test only(st) == DiffEqGPU.LANE_ACTIVE
         @test only(pmin) ≈ min(1.0, abs(w22 - 1) / w22) rtol = 1.0e-3
     end
-    @test DiffEqGPU.lane_pivot_status(NaN) == DiffEqGPU.LANE_PIVOT
+    @test DiffEqGPU.lane_pivot_status(NaN, 0.0) == DiffEqGPU.LANE_PIVOT
     @test DiffEqGPU.lane_retcode(DiffEqGPU.LANE_PIVOT) == SciMLBase.ReturnCode.InternalLinearSolveFailed
     # A matching uses a pattern entry that is zero in the values only where no zero-free one
     # exists.
@@ -395,6 +395,14 @@ end
         @test abs(sparse_sol.u[i].stats.naccept - dense_sol.u[i].stats.naccept) <= 1
         @test max_state_error(sparse_sol.u[i], dense_sol.u[i]) < 1.0e-8
     end
+    # `pivot_threshold = 0` switches only on a NaN pivot ratio.
+    logs, _ = Test.collect_test_logs(min_level = Logging.Debug) do
+        solve(ens(trip_problem(P)), a, lanes(pivot_threshold = 0); trajectories = 2, kwargs...)
+    end
+    @test !any(l -> occursin("switched to the dense LU", string(l.message)), logs)
+    @test lanes().pivot_threshold == 1.0e-7
+    @test_throws ArgumentError lanes(pivot_threshold = -1)
+    @test_throws ArgumentError lanes(pivot_threshold = NaN)
     # A lane whose dense factorization is singular too stops; one that has already finished
     # keeps its status.
     status = [DiffEqGPU.LANE_ACTIVE, DiffEqGPU.LANE_ACTIVE, DiffEqGPU.LANE_SUCCESS]

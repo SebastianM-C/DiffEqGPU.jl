@@ -24,7 +24,8 @@ solve(ensemble_prob, Tsit5(), ensemblealg; trajectories = 100)
 struct EnsembleCPUArray <: EnsembleArrayAlgorithm end
 
 """
-    EnsembleGPUArray(backend, cpu_offload = 0.2; threaded_host = false, per_trajectory_dt = false)
+    EnsembleGPUArray(backend, cpu_offload = 0.2; threaded_host = false, per_trajectory_dt = false,
+        pivot_threshold = 1.0e-7)
 
 An `EnsembleArrayAlgorithm` that uses one kernel per trajectory while storing the
 trajectories in a batched array. This is the appropriate choice when the ODE solver or
@@ -36,6 +37,7 @@ right-hand side cannot be compiled into one fused `EnsembleGPUKernel` solve.
   - `cpu_offload`: the fraction of trajectories solved on the CPU. The default is `0.2`.
   - `threaded_host`: whether the host-side preparation of each batch runs on several threads.
   - `per_trajectory_dt`: whether every trajectory takes its own adaptive steps.
+  - `pivot_threshold`: the pivot check of the per-trajectory sparse LU.
 
 # Arguments
 
@@ -56,6 +58,12 @@ right-hand side cannot be compiled into one fused `EnsembleGPUKernel` solve.
   - `per_trajectory_dt`: when `true`, every trajectory keeps its own time, step size and
     step acceptance, instead of the whole batch advancing with one shared step; see
     "Per-trajectory steps" below. Supports `Rodas5P` only. Defaults to `false`.
+  - `pivot_threshold`: with `per_trajectory_dt` and a sparse `jac_prototype`, a trajectory
+    whose fixed-order factorization keeps less than this fraction of a pivot
+    (`min_k |U[k, k]| / |W[k, k]|`, see `DiffEqGPU.lane_pivot_status`) switches to a pivoted
+    dense LU. The dense LU costs a step about the same whether one trajectory or many use it,
+    so a model whose fixed order stays accurate at smaller ratios can lower the threshold;
+    `0` switches only on a NaN. Defaults to `1.0e-7`.
 
 # Returns
 
@@ -256,7 +264,7 @@ models whose algebraic equations keep their structure, and makes the factorizati
 solves a fraction of dense LU's. The pattern must contain every entry the right-hand side can
 make nonzero: with the coloring, a missing entry also corrupts other stored entries. Each
 trajectory's factorization and solves run on a group of threads. A trajectory whose fixed pivot
-order loses a pivot to cancellation during the elimination (see `DiffEqGPU.lane_pivot_status`)
+order loses a pivot to cancellation during the elimination (below `pivot_threshold`)
 switches to a pivoted dense LU, the factorization a solve of that trajectory on its own uses,
 for the rest of its solve; it stops with `ReturnCode.InternalLinearSolveFailed` only if that is
 singular too.
@@ -289,12 +297,19 @@ struct EnsembleGPUArray{Backend} <: EnsembleArrayAlgorithm
     cpu_offload::Float64
     threaded_host::Bool
     per_trajectory_dt::Bool
+    pivot_threshold::Float64
 end
 
 function EnsembleGPUArray(
-        backend, cpu_offload; threaded_host::Bool = false, per_trajectory_dt::Bool = false
+        backend, cpu_offload; threaded_host::Bool = false, per_trajectory_dt::Bool = false,
+        pivot_threshold::Real = LANE_PIVOT_THRESHOLD
     )
-    return EnsembleGPUArray(backend, Float64(cpu_offload), threaded_host, per_trajectory_dt)
+    0 <= pivot_threshold < Inf || throw(
+        ArgumentError("`pivot_threshold` must be finite and nonnegative; got $pivot_threshold.")
+    )
+    return EnsembleGPUArray(
+        backend, Float64(cpu_offload), threaded_host, per_trajectory_dt, Float64(pivot_threshold)
+    )
 end
 
 """
@@ -388,8 +403,8 @@ cpu_alg = Dict(
 
 # Work around the fact that Zygote cannot handle the task system
 # Work around the fact that Zygote isderiving fails with constants?
-function EnsembleGPUArray(dev; threaded_host::Bool = false, per_trajectory_dt::Bool = false)
-    return EnsembleGPUArray(dev, 0.2; threaded_host, per_trajectory_dt)
+function EnsembleGPUArray(dev; kwargs...)
+    return EnsembleGPUArray(dev, 0.2; kwargs...)
 end
 
 function EnsembleGPUKernel(dev)
