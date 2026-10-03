@@ -644,6 +644,7 @@ function _lane_options(prob, kwargs)
         :abstol, :reltol, :saveat, :save_start, :save_end, :save_everystep, :dt, :dtmax,
         :tstops, :maxiters, :callback, :merge_callbacks, :initializealg, :verbose,
         :unstable_check, :dense, :restore_stop_dt, :internalnorm,
+        :save_discretes,
     )
     unknown = filter(k -> !(k in known), keys(opts))
     isempty(unknown) || throw(
@@ -653,6 +654,15 @@ function _lane_options(prob, kwargs)
     )
     if get(opts, :dense, false) === true
         throw(ArgumentError("`per_trajectory_dt = true` does not support `dense = true`; pass `saveat`."))
+    end
+    # ModelingToolkit stores its problem keyword `save_discretes` as a solve option. The
+    # per-trajectory stepper saves the states only.
+    if get(opts, :save_discretes, false) !== false
+        throw(
+            ArgumentError(
+                "`per_trajectory_dt = true` does not save discrete values: pass `save_discretes = false`."
+            )
+        )
     end
     return opts
 end

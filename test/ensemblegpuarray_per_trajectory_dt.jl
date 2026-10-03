@@ -382,6 +382,7 @@ end
         (alg, (; good..., adaptive = false, dt = 0.01)),
         (alg, (; good..., callback = ContinuousCallback((u, t, i) -> u[1] - 0.5, i -> nothing))),
         (alg, (; good..., callback = PeriodicCallback(kick!, 0.25))),
+        (alg, (; good..., save_discretes = true)),
     )
     for (a, kwargs) in cases
         @test_throws ArgumentError DiffEqGPU.check_per_trajectory_dt(prob, a, lanes(); kwargs...)
