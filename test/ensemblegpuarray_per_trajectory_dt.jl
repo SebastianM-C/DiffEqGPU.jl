@@ -132,27 +132,6 @@ end
     end
 end
 
-@testset "restore_stop_dt" begin
-    # Opt-in: after a step shortened onto a stop, continue from the unshortened proposal.
-    # Fewer steps when several steps fit between the stops, at the accuracy of the tolerance.
-    cb() = PeriodicCallback(kick!, 0.1; save_positions = (false, false))
-    prob = ODEProblem(decay!, [1.0, 0.0], (0.0, 2.0), [1.0, 0.3]; callback = cb())
-    eprob = EnsembleProblem(prob; prob_func = decay_func, safetycopy = false)
-    kwargs = (; abstol = 1.0e-7, reltol = 1.0e-7, saveat = 0.1)
-    default = solve(eprob, alg, lanes(); trajectories = length(decay_ks), kwargs...)
-    restored = solve(eprob, alg, lanes(); trajectories = length(decay_ks), restore_stop_dt = true, kwargs...)
-    steps(sol) = sum(s.stats.naccept + s.stats.nreject for s in sol.u)
-    @test steps(restored) < 0.8 * steps(default)
-    for i in eachindex(decay_ks)
-        ref = solve(
-            decay_func(remake(prob; callback = cb()), (; sim_id = i)), alg;
-            abstol = 1.0e-11, reltol = 1.0e-11, saveat = 0.1
-        )
-        @test restored.u[i].retcode == SciMLBase.ReturnCode.Success
-        @test max_state_error(restored.u[i], ref) < 1.0e-6
-    end
-end
-
 @testset "ModelingToolkit periodic event" begin
     @variables x(t) = 0.0 v(t) = 0.0
     @parameters k = 1.0
@@ -406,6 +385,7 @@ end
         (alg, (; good..., callback = ContinuousCallback((u, t, i) -> u[1] - 0.5, i -> nothing))),
         (alg, (; good..., callback = PeriodicCallback(kick!, 0.25))),
         (alg, (; good..., save_discretes = true)),
+        (alg, (; good..., restore_stop_dt = true)),
     )
     for (a, kwargs) in cases
         @test_throws ArgumentError DiffEqGPU.check_per_trajectory_dt(prob, a, lanes(); kwargs...)

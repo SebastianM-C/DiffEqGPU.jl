@@ -241,18 +241,9 @@ periodic events, with `save_positions = (false, false)`. Other callbacks and opt
 output; at a time where a periodic affect fires, the value before the affect is saved, as
 OrdinaryDiffEq does with `save_positions = (false, false)`.
 
-By default the step-size control is OrdinaryDiffEq's, including how it continues after a step
-was shortened to land on a stop (a `tstops` entry or a periodic callback's time): the next
-step grows from the shortened step, because OrdinaryDiffEq shortens twice per step and its
-restore of the proposal before shortening then restores the shortened step. The `solve`
-keyword `restore_stop_dt = true` (an opt-in, `false` by default) continues from the proposal
-before shortening instead. On problems with dense stops, such as a clocked controller that
-stops every few steps, this avoids regrowing the step after every stop: on a 124-unknown
-DAE with a 10 ms clock it took about 27% fewer steps (rejected ones included) at
-equal tolerance and about 1.2 times fewer at matched achieved error, without more rejected
-steps. The step after a stop is then sized for the error of a full step although the
-shortened step's error estimate was smaller, so its achieved error can be slightly larger at
-a given tolerance; compare the two at matched error, not at equal tolerance.
+The step-size control is OrdinaryDiffEq's, including how it continues after a step was
+shortened to land on a stop (a `tstops` entry or a periodic callback's time): the next step
+grows from the shortened step, as in the current OrdinaryDiffEq release.
 
 With a `SparseMatrixCSC` `jac_prototype` (the pattern of the Jacobian of one trajectory), the
 stepper stores each trajectory's Jacobian as the values of that pattern, computes it with one

@@ -234,7 +234,6 @@ struct LaneStepper{T, Tt, M, S, V, I8, I32, BV, TB, CO, F, P, CB}
     dtmin::Tt
     dtmax::Tt
     maxiters::Int32
-    restore_stop_dt::Bool
     f::F
     p::P
     callbacks::CB
@@ -425,7 +424,7 @@ end
 @kernel function lane_controller_kernel(
         t, dt, dtprop, tprev, hprev, errold, status, fresh, clamped, naccept, nreject,
         stop_idx, landed, save_idx, save_hi, save_at, @Const(EEst), @Const(stops), @Const(savet),
-        @Const(ctrl), @Const(dtmin), @Const(dtmax), @Const(maxiters), @Const(restore_stop_dt)
+        @Const(ctrl), @Const(dtmin), @Const(dtmax), @Const(maxiters)
     )
     i = @index(Global, Linear)
     @inbounds if status[i] == LANE_ACTIVE
@@ -487,9 +486,8 @@ end
                 else
                     dt[i], clamped[i] = _next_dt(t[i], dtnew, stops, stop_idx[i])
                     # See `lane_pi_controller`: after an accepted step OrdinaryDiffEq keeps
-                    # the shortened step as its proposal; `restore_stop_dt` keeps the
-                    # unshortened one instead.
-                    dtprop[i] = accept && !restore_stop_dt ? dt[i] : dtnew
+                    # the shortened step as its proposal.
+                    dtprop[i] = accept ? dt[i] : dtnew
                 end
             end
         end
@@ -642,7 +640,7 @@ function _lane_options(prob, kwargs)
     known = (
         :abstol, :reltol, :saveat, :save_start, :save_end, :save_everystep, :dt, :dtmax,
         :tstops, :maxiters, :callback, :merge_callbacks, :initializealg, :verbose,
-        :unstable_check, :dense, :restore_stop_dt, :internalnorm,
+        :unstable_check, :dense, :internalnorm,
         :save_discretes,
     )
     unknown = filter(k -> !(k in known), keys(opts))
@@ -844,7 +842,7 @@ function _lane_settings(prob, alg, ensemblealg; adaptive = true, kwargs...)
     return (;
         opts, central, pattern, abstol, reltol, saveat, save_start, save_end, callbacks,
         dtmax = get(opts, :dtmax, tf - t0), maxiters = get(opts, :maxiters, 100_000),
-        restore_stop_dt = Bool(get(opts, :restore_stop_dt, false)), tstops = get(opts, :tstops, ()),
+        tstops = get(opts, :tstops, ()),
         norm,
     )
 end
@@ -868,7 +866,6 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
     savet = Tt.(_lane_save_times(set.saveat, set.save_start, set.save_end, t0, tf))
     dtmax = Tt(set.dtmax)
     maxiters = Int32(set.maxiters)
-    restore_stop_dt = set.restore_stop_dt
     dtmin = eps(max(abs(t0), abs(tf)))
     callbacks = set.callbacks
     stops, stop_mask = _lane_stops(callbacks, set.tstops, t0, tf, Tt)
@@ -918,7 +915,7 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
         lv(Int32(1), Int32), lv(Int32(0), Int32), lv(Int32(0), Int32),
         dev(stops), dev(stop_mask), dev(savet), saves,
         LaneRodasTableau(T), LaneControllerOptions(T), abstol, reltol, dtmin, dtmax,
-        maxiters, restore_stop_dt, f, p, callbacks, sparsity, nothing,
+        maxiters, f, p, callbacks, sparsity, nothing,
         pattern === nothing ? nothing : _lane_values(u0, T, B, N),
         pattern === nothing ? nothing : lv(one(T), T),
         norm_weights, nkeep,
@@ -1119,8 +1116,7 @@ function lane_step!(st, iip, wgs)
     lane_controller_kernel(backend)(
         st.t, st.dt, st.dtprop, st.tprev, st.hprev, st.errold, st.status, st.fresh,
         st.clamped, st.naccept, st.nreject, st.stop_idx, st.landed, st.save_idx, st.save_hi,
-        st.save_at, st.EEst, st.stops, st.savet, st.ctrl, st.dtmin, st.dtmax, st.maxiters,
-        st.restore_stop_dt;
+        st.save_at, st.EEst, st.stops, st.savet, st.ctrl, st.dtmin, st.dtmax, st.maxiters;
         ndrange = B, workgroupsize = wgs
     )
 
