@@ -280,7 +280,9 @@ end
     end
 end
 
-# `fd_jacobian_kernel` for the lanes that need a new Jacobian, at their own times.
+# `fd_jacobian_kernel` for the lanes that need a new Jacobian, at their own times. The central
+# differences' two evaluations go through one call of the right-hand side, so that they share
+# its compiled code (two inlined copies may round differently).
 @kernel function lane_fd_jacobian_kernel(
         f, iip, J, up, fp, fm, @Const(u), @Const(f0), @Const(p), @Const(t), @Const(jlo),
         @Const(ncols), @Const(rel), @Const(central), @Const(status), @Const(fresh)
@@ -292,24 +294,22 @@ end
     @inbounds if status[i] == LANE_ACTIVE && fresh[i]
         ti = t[i]
         uc = view(up, g, :)
-        fpc = view(fp, g, :)
         for k in 1:N
             uc[k] = u[k, i]
         end
         uj = u[j, i]
-        uc[j] = uj + rel * max(one(uj), abs(uj))
-        h = uc[j] - uj
-        trajectory_rhs!(f, iip, fpc, uc, p, i, ti)
+        h = (uj + rel * max(one(uj), abs(uj))) - uj
+        for ev in 1:(central ? 2 : 1)
+            uc[j] = ev == 1 ? uj + rel * max(one(uj), abs(uj)) : uj - h
+            trajectory_rhs!(f, iip, ev == 1 ? view(fp, g, :) : view(fm, g, :), uc, p, i, ti)
+        end
         if central
-            uc[j] = uj - h
-            fmc = view(fm, g, :)
-            trajectory_rhs!(f, iip, fmc, uc, p, i, ti)
             for k in 1:N
-                J[k, j, i] = (fpc[k] - fmc[k]) / (2 * h)
+                J[k, j, i] = (fp[g, k] - fm[g, k]) / (2 * h)
             end
         else
             for k in 1:N
-                J[k, j, i] = (fpc[k] - f0[k, i]) / h
+                J[k, j, i] = (fp[g, k] - f0[k, i]) / h
             end
         end
     end

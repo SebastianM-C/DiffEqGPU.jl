@@ -405,42 +405,27 @@ end
         ti = t[i]
         cols = sp.color_ptr[c]:(sp.color_ptr[c + 1] - 1)
         uc = view(up, g, :)
-        fpc = view(fp, g, :)
         for k in 1:N
             uc[k] = u[k, i]
+        end
+        # One call of the right-hand side for both central evaluations (see
+        # `lane_fd_jacobian_kernel`).
+        for ev in 1:(central ? 2 : 1)
+            for q in cols
+                j = sp.color_cols[q]
+                uj = u[j, i]
+                uc[j] = ev == 1 ? uj + rel * max(one(uj), abs(uj)) :
+                    uj - ((uj + rel * max(one(uj), abs(uj))) - uj)
+            end
+            trajectory_rhs!(f, iip, ev == 1 ? view(fp, g, :) : view(fm, g, :), uc, p, i, ti)
         end
         for q in cols
             j = sp.color_cols[q]
             uj = u[j, i]
-            uc[j] = uj + rel * max(one(uj), abs(uj))
-        end
-        trajectory_rhs!(f, iip, fpc, uc, p, i, ti)
-        if central
-            for q in cols
-                j = sp.color_cols[q]
-                uj = u[j, i]
-                uc[j] = uj - ((uj + rel * max(one(uj), abs(uj))) - uj)
-            end
-            fmc = view(fm, g, :)
-            trajectory_rhs!(f, iip, fmc, uc, p, i, ti)
-            for q in cols
-                j = sp.color_cols[q]
-                uj = u[j, i]
-                h = (uj + rel * max(one(uj), abs(uj))) - uj
-                for e in sp.colptr[j]:(sp.colptr[j + 1] - 1)
-                    r = sp.rowval[e]
-                    Jv[i, e] = (fpc[r] - fmc[r]) / (2 * h)
-                end
-            end
-        else
-            for q in cols
-                j = sp.color_cols[q]
-                uj = u[j, i]
-                h = (uj + rel * max(one(uj), abs(uj))) - uj
-                for e in sp.colptr[j]:(sp.colptr[j + 1] - 1)
-                    r = sp.rowval[e]
-                    Jv[i, e] = (fpc[r] - f0[r, i]) / h
-                end
+            h = (uj + rel * max(one(uj), abs(uj))) - uj
+            for e in sp.colptr[j]:(sp.colptr[j + 1] - 1)
+                r = sp.rowval[e]
+                Jv[i, e] = central ? (fp[g, r] - fm[g, r]) / (2 * h) : (fp[g, r] - f0[r, i]) / h
             end
         end
     end
