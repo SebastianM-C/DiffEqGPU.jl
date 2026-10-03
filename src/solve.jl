@@ -517,7 +517,7 @@ function batch_solve_up(ensembleprob, probs, alg, ensemblealg, I, u0, p; kwargs.
         _alg = alg
     end
 
-    norm = TrajectoryNorm(len)
+    norm, kwargs = batched_norm(len, u0, kwargs)
     sol = solve(
         prob, _alg; internalnorm = norm,
         batched_initializealg(prob, kwargs)..., kwargs...,
@@ -633,8 +633,9 @@ function ChainRulesCore.rrule(
         _alg = alg
     end
 
+    norm, kwargs = batched_norm(len, u0, kwargs)
     sol = solve(
-        prob, _alg; internalnorm = TrajectoryNorm(len),
+        prob, _alg; internalnorm = norm,
         batched_initializealg(prob, kwargs)..., kwargs...,
         callback = _callback, merge_callbacks = false
     )

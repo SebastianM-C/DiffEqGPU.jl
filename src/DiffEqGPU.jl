@@ -262,7 +262,7 @@ export terminate!
     make_prob_compatible, make_static_storage, StaticAdaptor, maxthreads,
     maybe_prefer_blocks, lufact!,
     vectorized_solve, vectorized_asolve, vectorized_map_solve, gpu_affect_transform,
-    GPUArrayAffect, check_per_trajectory_dt
+    GPUArrayAffect, check_per_trajectory_dt, ComponentNorm
 
 @setup_workload begin
     @compile_workload begin

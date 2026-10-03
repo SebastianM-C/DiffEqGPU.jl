@@ -298,6 +298,58 @@ end
     @test !DiffEqGPU._lane_structurally_nonsingular(P0)
 end
 
+@testset "ComponentNorm: error control of some components" begin
+    # The chain's algebraic components z are explicit functions of x: control x only.
+    norm = DiffEqGPU.ComponentNorm(1:chain_n)
+    kwargs = (; abstol = 1.0e-8, reltol = 1.0e-6, saveat = 0.5)
+    prob = chain_problem(nothing)
+    ens = EnsembleProblem(prob; prob_func = chain_func, safetycopy = false)
+    masked = solve(ens, alg, lanes(); trajectories = 4, kwargs..., internalnorm = norm)
+    full = solve(ens, alg, lanes(); trajectories = 4, kwargs...)
+    for i in 1:4
+        ref = solve(chain_func(prob, (; sim_id = i)), alg; kwargs..., internalnorm = norm)
+        @test masked.u[i].retcode == SciMLBase.ReturnCode.Success
+        @test max_state_error(masked.u[i], ref) < 1.0e-7
+        @test abs(masked.u[i].stats.naccept - ref.stats.naccept) <= 1
+        @test abs(masked.u[i].stats.nreject - ref.stats.nreject) <= 1
+    end
+    # The norm divides by the kept count: leaving out components with small errors raises the
+    # RMS of the rest, so here the mask takes more steps, not fewer.
+    @test [s.stats.naccept for s in masked.u] != [s.stats.naccept for s in full.u]
+    # Keeping every component is the default norm; a mask is the same as its indices.
+    every = solve(ens, alg, lanes(); trajectories = 4, kwargs..., internalnorm = DiffEqGPU.ComponentNorm(trues(2chain_n)))
+    @test [s.stats.naccept for s in every.u] == [s.stats.naccept for s in full.u]
+    # An ODE: the initial step size uses the norm too.
+    rober = rober_problems.ODE
+    rnorm = DiffEqGPU.ComponentNorm([1, 3])
+    rkw = (; abstol = 1.0e-8, reltol = 1.0e-6, saveat = 10.0, internalnorm = rnorm)
+    rsol = solve(EnsembleProblem(rober; prob_func = rober_func, safetycopy = false), alg, lanes(); trajectories = 3, rkw...)
+    for i in 1:3
+        ref = solve(rober_func(rober, (; sim_id = i)), alg; rkw...)
+        @test abs(rsol.u[i].stats.naccept - ref.stats.naccept) <= 1
+        @test max_state_error(rsol.u[i], ref) < 1.0e-7
+    end
+    # The shared step of `EnsembleGPUArray`: one trajectory steps as its own solve.
+    lock = solve(ens, alg, EnsembleGPUArray(backend, 0.0); trajectories = 1, kwargs..., internalnorm = norm)
+    ref1 = solve(chain_func(prob, (; sim_id = 1)), alg; kwargs..., internalnorm = norm)
+    @test lock.u[1].retcode == SciMLBase.ReturnCode.Success
+    @test abs(lock.u[1].stats.naccept - ref1.stats.naccept) <= 1
+    @test max_state_error(lock.u[1], ref1) < 1.0e-7
+    # Invalid masks throw.
+    @test_throws ArgumentError DiffEqGPU.ComponentNorm(Int[])
+    @test_throws ArgumentError DiffEqGPU.ComponentNorm([0, 1])
+    @test_throws ArgumentError DiffEqGPU.ComponentNorm([1, 1])
+    @test_throws ArgumentError DiffEqGPU.ComponentNorm(falses(3))
+    @test_throws ArgumentError DiffEqGPU.ComponentNorm([2])(ones(1), 0.0)
+    for bad in (DiffEqGPU.ComponentNorm([1, 2chain_n + 1]), DiffEqGPU.ComponentNorm(trues(3)), (u, t) -> 1.0)
+        @test_throws ArgumentError DiffEqGPU.check_per_trajectory_dt(prob, alg, lanes(); kwargs..., internalnorm = bad)
+    end
+    @test_throws ArgumentError solve(
+        ens, alg, EnsembleGPUArray(backend, 0.0); trajectories = 1, kwargs...,
+        internalnorm = DiffEqGPU.ComponentNorm(trues(3))
+    )
+end
+
 @testset "Unsupported settings throw, at setup and in the solve" begin
     prob = ODEProblem(decay!, [1.0, 0.0], (0.0, 1.0), [1.0, 0.3])
     eprob = EnsembleProblem(prob; prob_func = decay_func, safetycopy = false)

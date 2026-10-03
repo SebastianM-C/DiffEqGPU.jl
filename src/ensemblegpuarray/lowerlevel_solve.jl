@@ -92,8 +92,9 @@ function vectorized_map_solve_up(prob, alg, ensemblealg, I, u0, p; kwargs...)
         _alg = alg
     end
 
+    norm, kwargs = batched_norm(len, u0, kwargs)
     return sol = solve(
-        prob, _alg; internalnorm = TrajectoryNorm(len), kwargs...,
+        prob, _alg; internalnorm = norm, kwargs...,
         callback = _callback, merge_callbacks = false
     )
 end

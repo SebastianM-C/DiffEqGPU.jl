@@ -243,6 +243,8 @@ struct LaneStepper{T, Tt, M, S, V, I8, I32, BV, TB, CO, F, P, CB}
     lu_scratch::Any # B × N scratch of the sparse factorization and solves
     pivot_min::Any  # B smallest pivot ratio of the sparse factorizations so far
     lu_threads::Int # threads per lane of the sparse factorization and solves (1: per-lane kernels)
+    norm_weights::Any # N weights of a `ComponentNorm` (1 kept, 0 not), or `nothing`
+    nkeep::Int      # the number of components in the error norm
     backend::Any
 end
 
@@ -385,19 +387,28 @@ end
     end
 end
 
+# The weight of component k in the error norm: 1, or that of a `ComponentNorm` (1 kept, 0 not).
+@inline _norm_weight(::Nothing, k, ::Type{T}) where {T} = one(T)
+@inline _norm_weight(weights, k, ::Type{T}) where {T} = @inbounds T(weights[k])
+
 # EEst = RMS over the lane's components of k_8 / (abstol + max(|uprev|, |u|) reltol), the
-# default `internalnorm` and `calculate_residuals` of OrdinaryDiffEq.
-@kernel function lane_error_kernel(EEst, @Const(K), @Const(u), @Const(uprev), @Const(abstol), @Const(reltol), @Const(status))
+# default `internalnorm` and `calculate_residuals` of OrdinaryDiffEq; with `weights`, over the
+# `nkeep` components a `ComponentNorm` keeps.
+@kernel function lane_error_kernel(
+        EEst, @Const(K), @Const(u), @Const(uprev), @Const(abstol), @Const(reltol), @Const(status),
+        @Const(weights), @Const(nkeep)
+    )
     i = @index(Global, Linear)
     @inbounds if status[i] == LANE_ACTIVE
         N = size(u, 1)
-        acc = zero(eltype(EEst))
+        T = eltype(EEst)
+        acc = zero(T)
         for k in 1:N
             sk = abstol + max(abs(uprev[k, i]), abs(u[k, i])) * reltol
             e = K[k, i, 8] / sk
-            acc += e * e
+            acc += _norm_weight(weights, k, T) * e * e
         end
-        EEst[i] = sqrt(acc / N)
+        EEst[i] = sqrt(acc / nkeep)
     end
 end
 
@@ -566,20 +577,22 @@ end
 
 @kernel function lane_initdt1_kernel(
         dt, u1, @Const(u0), @Const(f0), @Const(mass_diag), @Const(abstol), @Const(reltol),
-        @Const(dtmax), @Const(smalldt)
+        @Const(dtmax), @Const(smalldt), @Const(weights), @Const(nkeep)
     )
     i = @index(Global, Linear)
     @inbounds begin
         N = size(u0, 1)
-        d0 = zero(eltype(u0))
-        d1 = zero(eltype(u0))
+        T = eltype(u0)
+        d0 = zero(T)
+        d1 = zero(T)
         for k in 1:N
             sk = abstol + abs(u0[k, i]) * reltol
-            d0 += (u0[k, i] / sk)^2
-            d1 += (f0[k, i] / _mass_diagonal(mass_diag, k, u0) / sk)^2
+            w = _norm_weight(weights, k, T)
+            d0 += w * (u0[k, i] / sk)^2
+            d1 += w * (f0[k, i] / _mass_diagonal(mass_diag, k, u0) / sk)^2
         end
-        d0 = sqrt(d0 / N)
-        d1 = sqrt(d1 / N)
+        d0 = sqrt(d0 / nkeep)
+        d1 = sqrt(d1 / nkeep)
         dt0 = (d0 < 1.0e-5 || d1 < 1.0e-5) ? smalldt : (d0 / d1) / 100
         dt0 = min(dt0, dtmax)
         dt[i] = dt0
@@ -591,24 +604,26 @@ end
 
 @kernel function lane_initdt2_kernel(
         dt, @Const(u0), @Const(f0), @Const(f1), @Const(mass_diag), @Const(abstol),
-        @Const(reltol), @Const(dtmax), @Const(dtmin), @Const(order)
+        @Const(reltol), @Const(dtmax), @Const(dtmin), @Const(order), @Const(weights), @Const(nkeep)
     )
     i = @index(Global, Linear)
     @inbounds begin
         N = size(u0, 1)
+        T = eltype(u0)
         dt0 = dt[i]
-        d2 = zero(eltype(u0))
-        d1 = zero(eltype(u0))
+        d2 = zero(T)
+        d1 = zero(T)
         same = true
         for k in 1:N
             sk = abstol + abs(u0[k, i]) * reltol
             m = _mass_diagonal(mass_diag, k, u0)
-            d2 += ((f1[k, i] - f0[k, i]) / m / sk)^2
-            d1 += (f0[k, i] / m / sk)^2
+            w = _norm_weight(weights, k, T)
+            d2 += w * ((f1[k, i] - f0[k, i]) / m / sk)^2
+            d1 += w * (f0[k, i] / m / sk)^2
             same &= f1[k, i] == f0[k, i]
         end
-        d2 = sqrt(d2 / N) / dt0
-        d1 = sqrt(d1 / N)
+        d2 = sqrt(d2 / nkeep) / dt0
+        d1 = sqrt(d1 / nkeep)
         if same
             dt[i] = max(dtmin, 100dt0)
         else
@@ -628,7 +643,7 @@ function _lane_options(prob, kwargs)
     known = (
         :abstol, :reltol, :saveat, :save_start, :save_end, :save_everystep, :dt, :dtmax,
         :tstops, :maxiters, :callback, :merge_callbacks, :initializealg, :verbose,
-        :unstable_check, :dense, :restore_stop_dt,
+        :unstable_check, :dense, :restore_stop_dt, :internalnorm,
     )
     unknown = filter(k -> !(k in known), keys(opts))
     isempty(unknown) || throw(
@@ -808,10 +823,20 @@ function _lane_settings(prob, alg, ensemblealg; adaptive = true, kwargs...)
     save_start = get(opts, :save_start, saveat isa Number || isempty(saveat) || t0 in saveat)
     save_end = get(opts, :save_end, true)
     callbacks = _lane_callbacks(prob, ensemblealg; kwargs...)
+    norm = get(opts, :internalnorm, nothing)
+    if norm !== nothing
+        norm isa ComponentNorm || throw(
+            ArgumentError(
+                "`per_trajectory_dt = true` supports `internalnorm = DiffEqGPU.ComponentNorm(keep)` only; got a `$(typeof(norm))`."
+            )
+        )
+        _check_component_norm(norm, N)
+    end
     return (;
         opts, central, pattern, abstol, reltol, saveat, save_start, save_end, callbacks,
         dtmax = get(opts, :dtmax, tf - t0), maxiters = get(opts, :maxiters, 100_000),
         restore_stop_dt = Bool(get(opts, :restore_stop_dt, false)), tstops = get(opts, :tstops, ()),
+        norm,
     )
 end
 
@@ -844,6 +869,13 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
 
     dev(x) = adapt(backend, x)
     zN() = fill!(similar(u0, T, N, B), zero(T))
+    norm_weights, nkeep = if set.norm === nothing
+        nothing, N
+    else
+        w = zeros(T, N)
+        w[set.norm.keep] .= 1
+        copyto!(similar(u0, T, N), w), length(set.norm.keep)
+    end
     pattern = set.pattern
     sparsity = pattern === nothing ? nothing : dev(_lane_sparsity(pattern))
     ncolumns = pattern === nothing ? N : length(sparsity.color_ptr) - 1
@@ -881,6 +913,7 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
         pattern === nothing ? nothing : _lane_values(u0, T, B, N, _lane_sparse_threads(B)),
         pattern === nothing ? nothing : lv(one(T), T),
         pattern === nothing ? 0 : _lane_sparse_threads(B),
+        norm_weights, nkeep,
         backend
     )
 
@@ -939,7 +972,7 @@ function _lane_initial_dt!(st, opts, iip, isdae, t0)
         )
         lane_initdt1_kernel(backend)(
             st.dt, st.u, st.uprev, st.fsal, st.mass_diag, st.abstol, st.reltol, st.dtmax,
-            smalldt; ndrange = B, workgroupsize = wgs
+            smalldt, st.norm_weights, st.nkeep; ndrange = B, workgroupsize = wgs
         )
         lane_rhs_kernel(backend)(
             st.f, iip, st.du, st.u, st.p, st.t, st.dt, one(Tt), st.status, st.fresh, false;
@@ -947,7 +980,7 @@ function _lane_initial_dt!(st, opts, iip, isdae, t0)
         )
         lane_initdt2_kernel(backend)(
             st.dt, st.uprev, st.fsal, st.du, st.mass_diag, st.abstol, st.reltol, st.dtmax,
-            dtmin, 5; ndrange = B, workgroupsize = wgs
+            dtmin, 5, st.norm_weights, st.nkeep; ndrange = B, workgroupsize = wgs
         )
         copyto!(st.u, st.uprev)
     end
@@ -1080,8 +1113,8 @@ function lane_step!(st, iip, wgs)
         st.u, st.K, st.tmp, st.uprev, tab, st.status; ndrange = nb, workgroupsize = nbwgs
     )
     lane_error_kernel(backend)(
-        st.EEst, st.K, st.u, st.uprev, st.abstol, st.reltol, st.status;
-        ndrange = B, workgroupsize = wgs
+        st.EEst, st.K, st.u, st.uprev, st.abstol, st.reltol, st.status, st.norm_weights,
+        st.nkeep; ndrange = B, workgroupsize = wgs
     )
 
     lane_controller_kernel(backend)(

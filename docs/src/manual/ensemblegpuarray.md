@@ -21,3 +21,9 @@ See the "Per-trajectory steps" section of [`EnsembleGPUArray`](@ref).
 ```@docs
 DiffEqGPU.check_per_trajectory_dt
 ```
+
+## Error control of some components
+
+```@docs
+DiffEqGPU.ComponentNorm
+```

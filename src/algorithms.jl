@@ -213,7 +213,9 @@ per trajectory (the RMS over its own components) and the largest of these decide
 acceptance and the next step, so every trajectory meets `abstol`/`reltol` as it would in a
 solve of its own. The shared step is therefore the one the hardest trajectory needs: a batch
 mixing easy and hard trajectories takes as many steps as the hard ones. Pass
-`internalnorm` to `solve` to replace this norm; it receives the batched state array.
+`internalnorm = DiffEqGPU.ComponentNorm(keep)` to measure each trajectory's error over the
+components `keep` only (see [`DiffEqGPU.ComponentNorm`](@ref)); any other `internalnorm`
+replaces this norm and receives the batched state array.
 
 # Per-trajectory steps
 
@@ -232,7 +234,8 @@ A trajectory that fails (`ReturnCode.Unstable`, `DtLessThanMin`, `MaxIters`) sto
 others continue. Supported: `Rodas5P` with `autodiff = AutoFiniteDiff()` (forward or central
 differences), diagonal mass matrices including singular ones, scalar `abstol` and `reltol`,
 `saveat` (or `save_everystep = false`), `save_start`, `save_end`, `dt`, `dtmax`, `tstops`,
-`maxiters`, a sparse `jac_prototype` (see below), and DiffEqCallbacks' `PeriodicCallback`s, including those of ModelingToolkit's
+`maxiters`, `internalnorm = DiffEqGPU.ComponentNorm(keep)`, a sparse `jac_prototype` (see
+below), and DiffEqCallbacks' `PeriodicCallback`s, including those of ModelingToolkit's
 periodic events, with `save_positions = (false, false)`. Other callbacks and options throw an
 `ArgumentError`. Saved values between two steps are interpolated with `Rodas5P`'s dense
 output; at a time where a periodic affect fires, the value before the affect is saved, as

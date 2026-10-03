@@ -10,13 +10,17 @@ diffeqgpunorm(u::ForwardDiff.Dual, t) = abs(ForwardDiff.value(u))
 # over the whole batch lets one hard trajectory be outvoted by the easy ones and miss its
 # own tolerance; the largest per-trajectory RMS makes the shared step the one the hardest
 # trajectory needs.
-struct TrajectoryNorm{R <: Ref{Int}}
+struct TrajectoryNorm{R <: Ref{Int}, W}
     len::Int
     # The trajectory with the largest error in the last norm of a state-shaped array: when the
     # shared step fails, the trajectory that made it fail.
     worst::R
+    # With a `ComponentNorm`: 1 for the kept components and 0 for the others (length `len`, on
+    # the state's device), and the number kept; `nothing` and `len` otherwise.
+    weights::W
+    nkeep::Int
 end
-TrajectoryNorm(len::Integer) = TrajectoryNorm(len, Ref(0))
+TrajectoryNorm(len::Integer) = TrajectoryNorm(len, Ref(0), nothing, Int(len))
 
 # OrdinaryDiffEq broadcasts the norm over residual arrays; treat it as a scalar like a function.
 Base.broadcastable(n::TrajectoryNorm) = Ref(n)
@@ -37,10 +41,89 @@ function (n::TrajectoryNorm)(u::AbstractArray, t)
     # An array not made of whole trajectories (no state-shaped solver array is) falls back
     # to the RMS over all entries.
     length(u) % n.len == 0 || return diffeqgpunorm(u, t)
-    sq = vec(sum(abs2 ∘ _norm_value, reshape(u, n.len, :); dims = 1))
+    R = reshape(u, n.len, :)
+    sq = if n.weights === nothing
+        vec(sum(abs2 ∘ _norm_value, R; dims = 1))
+    else
+        vec(sum(abs2.(_norm_value.(R)) .* n.weights; dims = 1))
+    end
     # `findmax` treats `NaN` as the largest value, so a trajectory gone non-finite is the worst.
     largest, n.worst[] = findmax(sq)
-    return sqrt(largest / n.len)
+    return sqrt(largest / n.nkeep)
+end
+
+"""
+    ComponentNorm(keep)
+    ComponentNorm(mask::AbstractVector{Bool})
+
+An error norm that controls only the state components `keep` (indices, or the `true`
+entries of `mask`): pass it to `solve` as `internalnorm = ComponentNorm(keep)`. It is
+OrdinaryDiffEq's default norm, the root mean square of the scaled error, taken over the kept
+components only and divided by their number, so with every component kept it is the default
+norm. It works for a solve of one problem on the CPU, for `EnsembleGPUArray` (the
+per-trajectory error of the shared step) and for `EnsembleGPUArray(...; per_trajectory_dt =
+true)`.
+
+The components left out have no error control: the step size is chosen as if their errors
+were zero. Leave out only components that the kept ones determine, such as algebraic
+variables that a model compiler made unknowns although they are explicit functions of other
+unknowns. Their accuracy then follows from that of the kept components, and including them
+in the norm only makes the steps smaller than the kept components need. Leaving out a
+component that evolves on its own lets its error grow unchecked. Compare the steps and the
+achieved error of the kept components with and without the mask before relying on it.
+
+Throws an `ArgumentError` for an empty `keep`, an index below 1 or repeated, and, when the
+norm is applied, for a state with fewer components than the largest kept index or, with a
+`mask`, a state whose length is not the mask's.
+"""
+struct ComponentNorm
+    keep::Vector{Int}   # sorted, unique, ≥ 1
+    len::Int            # the state length of a `mask`, or 0
+end
+function ComponentNorm(keep::AbstractVector{<:Integer})
+    k = sort!(Int.(collect(keep)))
+    isempty(k) && throw(ArgumentError("`ComponentNorm` needs at least one component to keep."))
+    first(k) >= 1 || throw(ArgumentError("`ComponentNorm`: the kept indices must be at least 1; got $(first(k))."))
+    allunique(k) || throw(ArgumentError("`ComponentNorm`: the kept indices must not repeat."))
+    return ComponentNorm(k, 0)
+end
+function ComponentNorm(mask::AbstractVector{Bool})
+    k = findall(mask)
+    isempty(k) && throw(ArgumentError("`ComponentNorm` needs at least one component to keep."))
+    return ComponentNorm(k, length(mask))
+end
+
+function _check_component_norm(n::ComponentNorm, N)
+    n.len == 0 || n.len == N || throw(
+        ArgumentError("`ComponentNorm`: the mask has $(n.len) entries, but the state has $N components.")
+    )
+    last(n.keep) <= N || throw(
+        ArgumentError("`ComponentNorm`: index $(last(n.keep)) is out of range for a state of $N components.")
+    )
+    return nothing
+end
+
+function (n::ComponentNorm)(u::AbstractArray, t)
+    _check_component_norm(n, length(u))
+    acc = sum(k -> abs2(_norm_value(@inbounds u[k])), n.keep)
+    return sqrt(acc / length(n.keep))
+end
+(::ComponentNorm)(u::Union{AbstractFloat, Complex}, t) = abs(u)
+(::ComponentNorm)(u::ForwardDiff.Dual, t) = abs(ForwardDiff.value(u))
+Base.broadcastable(n::ComponentNorm) = Ref(n)
+
+# The norm of a batched `EnsembleGPUArray` solve, and the solve keywords to pass along: a
+# `ComponentNorm` in `kwargs` becomes the weights of the `TrajectoryNorm` (which keeps finding
+# the failing trajectory); any other `internalnorm` stays in `kwargs` and replaces it.
+function batched_norm(len, u0, kwargs)
+    n = get(kwargs, :internalnorm, nothing)
+    n isa ComponentNorm || return TrajectoryNorm(len), kwargs
+    _check_component_norm(n, len)
+    w = zeros(real(eltype(u0)), len)
+    w[n.keep] .= 1
+    weights = copyto!(similar(u0, real(eltype(u0)), len), w)
+    rest = (; (k => v for (k, v) in pairs(kwargs) if k !== :internalnorm)...)
+    return TrajectoryNorm(len, Ref(0), weights, length(n.keep)), rest
 end
 
 # One return code per trajectory. A failed batch stops all of its trajectories at once, but only
