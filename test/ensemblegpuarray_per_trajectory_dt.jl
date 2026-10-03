@@ -282,6 +282,18 @@ end
         xc, scratch_c, Wc, status, dense, lu, 1; ndrange = (4, 2), workgroupsize = (4, 2)
     )
     @test vec(xc) ≈ W \ b rtol = 1.0e-12
+    # The dense fallback's solve: slot 1 holds lane 2, whose iteration matrix has a zero
+    # diagonal and needs row interchanges; lane 1 is not on the fallback and is left alone.
+    Wp = W[:, [2:N; 1]]
+    Fp = LinearAlgebra.lu(Wp)
+    @test any(Fp.ipiv .!= 1:N)
+    Wd2, ipiv2 = reshape(copy(Fp.factors), N, N, 1), reshape(Int32.(Fp.ipiv), N, 1)
+    b2 = [sin(2k) + 1 for k in 1:N]
+    status2 = fill(DiffEqGPU.LANE_ACTIVE, 2)
+    x2 = [b b2]
+    DiffEqGPU.lane_dense_solve_kernel(cpu)(x2, Wd2, ipiv2, Int32[2], status2, Val(N); ndrange = 4, workgroupsize = 4)
+    @test x2[:, 1] == b
+    @test x2[:, 2] ≈ Wp \ b2 rtol = 1.0e-12
     # Both kernel shapes on the test backend (the solves with fewer than 8192 trajectories use
     # only the cooperative ones), from the device copy of the operation list.
     dev(x) = DiffEqGPU.adapt(backend, x)
@@ -306,6 +318,12 @@ end
         xcd, sccd, Wcd, st_d, dense_d, lud, 1; ndrange = (4, 2), workgroupsize = (4, 2)
     )
     @test vec(Array(xcd)) ≈ W \ b rtol = 1.0e-12
+    x2d = dev([b b2])
+    DiffEqGPU.lane_dense_solve_kernel(backend)(
+        x2d, dev(Wd2), dev(ipiv2), dev(Int32[2]), dev(status2), Val(N); ndrange = 4, workgroupsize = 4
+    )
+    @test Array(x2d)[:, 1] == b
+    @test Array(x2d)[:, 2] ≈ Wp \ b2 rtol = 1.0e-12
     # The pivot check: with the order fixed to the identity, W = [1 1; 1 1 + 1e-12] keeps only
     # 1e-12 of its second pivot (σ = 1e-12), so the lane switches to the dense fallback; a
     # well-conditioned W does not.
@@ -377,13 +395,14 @@ end
         @test abs(sparse_sol.u[i].stats.naccept - dense_sol.u[i].stats.naccept) <= 1
         @test max_state_error(sparse_sol.u[i], dense_sol.u[i]) < 1.0e-8
     end
-    # A lane whose dense factorization is singular too stops.
-    status = [DiffEqGPU.LANE_ACTIVE, DiffEqGPU.LANE_ACTIVE]
-    Wd = zeros(2, 2, 2)
+    # A lane whose dense factorization is singular too stops; one that has already finished
+    # keeps its status.
+    status = [DiffEqGPU.LANE_ACTIVE, DiffEqGPU.LANE_ACTIVE, DiffEqGPU.LANE_SUCCESS]
+    Wd = zeros(2, 2, 3)
     Wd[:, :, 1] = [1.0 0; 0 1]
     Wd[:, :, 2] = [1.0 0; 0 0]
-    DiffEqGPU.lane_dense_check_kernel(DiffEqGPU.KernelAbstractions.CPU())(status, Wd, Int32[1, 2]; ndrange = 2)
-    @test status == [DiffEqGPU.LANE_ACTIVE, DiffEqGPU.LANE_PIVOT]
+    DiffEqGPU.lane_dense_check_kernel(DiffEqGPU.KernelAbstractions.CPU())(status, Wd, Int32[1, 2, 3]; ndrange = 3)
+    @test status == [DiffEqGPU.LANE_ACTIVE, DiffEqGPU.LANE_PIVOT, DiffEqGPU.LANE_SUCCESS]
 end
 
 @testset "ComponentNorm: error control of some components" begin

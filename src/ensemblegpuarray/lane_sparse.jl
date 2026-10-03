@@ -642,22 +642,97 @@ end
 
 # ---------------------------------------------------------------------------------------
 # Dense fallback: the lanes whose static-pivot factorization tripped `lane_pivot_status`
-# (`dense[i]`) are factorized with the batched pivoted dense LU from then on, gathered into a
-# K-lane batch each step.
+# (`dense[i]`) are factorized with the batched pivoted dense LU from then on, each in a slot
+# of the dense batch. The flags are sticky, so the slots change only when lanes switch.
 
-mutable struct LaneDenseFallback
-    lanes::Any  # cap lane indices (device, Int32); slots past the K in use hold 0
-    W::Any      # N × N × cap iteration matrices, LU-factored in place
-    ipiv::Any
-    x::Any      # N × cap right-hand sides and solutions
-    K::Int      # lanes in use
+mutable struct LaneDenseFallback{W, P, L}
+    W::W        # N × N × cap iteration matrices, LU-factored in place
+    ipiv::P
+    lanes::L    # cap lane indices (device, Int32); slots past the K in use hold 0
+    K::Int      # lanes with a slot
     cap::Int    # allocated slots; grows, never shrinks
 end
-LaneDenseFallback() = LaneDenseFallback(nothing, nothing, nothing, nothing, 0, 0)
+
+function LaneDenseFallback(like, ::Type{T}, N) where {T}
+    W = similar(like, T, N, N, 0)
+    return LaneDenseFallback(W, lu_pivots(W), similar(like, Int32, 0), 0, 0)
+end
+
+@inline function _dense_live(k, lanes, status)
+    @inbounds i = lanes[k]
+    return i != 0 && @inbounds(status[i] == LANE_ACTIVE)
+end
+
+# x[:, i] = W \ x[:, i] for the lane `i = lanes[k]` of each slot `k`, one workgroup per slot,
+# with the right-hand side in workgroup memory: a step of the substitutions then waits on it
+# rather than on global memory. The row interchanges are applied in order by one thread.
+@kernel function lane_dense_solve_kernel(x, @Const(Wd), @Const(ipiv), @Const(lanes), @Const(status), ::Val{N}) where {N}
+    k = @index(Group, Linear)
+    t = @index(Local, Linear)
+    @uniform T = @groupsize()[1]
+    y = @localmem eltype(x) (N,)
+    @inbounds if _dense_live(k, lanes, status)
+        i = lanes[k]
+        for r in t:T:N
+            y[r] = x[r, i]
+        end
+    end
+    @synchronize
+    @inbounds if _dense_live(k, lanes, status) && t == 1
+        for j in 1:N
+            p = ipiv[j, k]
+            if p != j
+                y[j], y[p] = y[p], y[j]
+            end
+        end
+    end
+    @synchronize
+    for j in 1:N
+        @inbounds if _dense_live(k, lanes, status)
+            yj = y[j]
+            for r in (j + t):T:N
+                y[r] = muladd(-Wd[r, j, k], yj, y[r])
+            end
+        end
+        @synchronize
+    end
+    # As in `lane_sparse_solve_coop_kernel`, y[j] stays undivided until the end.
+    for j in N:-1:1
+        @inbounds if _dense_live(k, lanes, status)
+            yj = y[j] / Wd[j, j, k]
+            for r in t:T:(j - 1)
+                y[r] = muladd(-Wd[r, j, k], yj, y[r])
+            end
+        end
+        @synchronize
+    end
+    @inbounds if _dense_live(k, lanes, status)
+        i = lanes[k]
+        for r in t:T:N
+            x[r, i] = y[r] / Wd[r, r, k]
+        end
+    end
+end
+
+const LANE_DENSE_SOLVE_THREADS = 64
+
+# x = W \ x for the lanes on the dense fallback (`_lane_dense_factorize!` factorized their W).
+function _lane_dense_ldiv!(st, x)
+    fb = st.dense_fallback
+    fb.K == 0 && return nothing
+    N = size(st.u, 1)
+    T = LANE_DENSE_SOLVE_THREADS
+    lane_dense_solve_kernel(st.backend)(
+        x, fb.W, fb.ipiv, fb.lanes, st.status, Val(N); ndrange = T * fb.cap, workgroupsize = T
+    )
+    return nothing
+end
 
 # W = J - M / (dt γ) of lane `lanes[k]` from its stored Jacobian entries, one thread per column;
-# an unused slot (lane 0) gets the identity.
-@kernel function lane_dense_w_kernel(Wd, @Const(lanes), @Const(Jv), @Const(sp), @Const(mass_diag), @Const(dt), @Const(gamma))
+# an unused slot (lane 0) and a lane that has stopped get the identity.
+@kernel function lane_dense_w_kernel(
+        Wd, @Const(lanes), @Const(status), @Const(Jv), @Const(sp), @Const(mass_diag), @Const(dt), @Const(gamma)
+    )
     c, k = @index(Global, NTuple)
     @inbounds begin
         i = lanes[k]
@@ -666,7 +741,7 @@ LaneDenseFallback() = LaneDenseFallback(nothing, nothing, nothing, nothing, 0, 0
         for r in 1:N
             Wd[r, c, k] = zero(T)
         end
-        if i == 0
+        if i == 0 || status[i] != LANE_ACTIVE
             Wd[c, c, k] = one(T)
         else
             for e in sp.colptr[c]:(sp.colptr[c + 1] - 1)
@@ -677,12 +752,12 @@ LaneDenseFallback() = LaneDenseFallback(nothing, nothing, nothing, nothing, 0, 0
     end
 end
 
-# A lane whose dense factorization has a zero or non-finite pivot stops (`LANE_PIVOT`).
+# An active lane whose dense factorization has a zero or non-finite pivot stops (`LANE_PIVOT`).
 @kernel function lane_dense_check_kernel(status, @Const(Wd), @Const(lanes))
     k = @index(Global, Linear)
     @inbounds begin
         i = lanes[k]
-        if i != 0
+        if i != 0 && status[i] == LANE_ACTIVE
             ok = true
             for c in 1:size(Wd, 1)
                 d = Wd[c, c, k]
@@ -693,72 +768,38 @@ end
     end
 end
 
-@kernel function lane_gather_kernel(xd, @Const(x), @Const(lanes))
-    r, k = @index(Global, NTuple)
-    @inbounds begin
-        i = lanes[k]
-        xd[r, k] = i == 0 ? zero(eltype(xd)) : x[r, i]
-    end
-end
-
-@kernel function lane_scatter_kernel(x, @Const(xd), @Const(lanes), @Const(status))
-    r, k = @index(Global, NTuple)
-    @inbounds begin
-        i = lanes[k]
-        i != 0 && status[i] == LANE_ACTIVE && (x[r, i] = xd[r, k])
-    end
-end
-
-# Gather the active dense lanes and factorize their W; returns the number of them. While no
-# lane has switched this costs one reduction over the flags; the buffers are allocated when the
-# first lane switches and grow (padded with identity matrices) but are not reallocated as lanes
-# switch or finish.
+# Factorize the W of the dense lanes; returns their number. While no lane has switched this
+# costs one reduction over the flags. When lanes switch, they get slots: the buffers grow
+# (padded with identity matrices) and the slots' lanes are uploaded.
 function _lane_dense_factorize!(st)
     fb = st.dense_fallback
-    fb.K = 0
-    count(st.dense_lane) == 0 && return 0
-    mask = Array(st.dense_lane) .& (Array(st.status) .== LANE_ACTIVE)
-    K = count(mask)
+    K = count(st.dense_lane)
     K == 0 && return 0
     backend = st.backend
     N = size(st.u, 1)
     T = eltype(st.u)
-    if K > fb.cap
-        cap = max(K, 2 * fb.cap, 8)
-        fb.W = fill!(similar(st.u, T, N, N, cap), zero(T))
-        fb.ipiv = lu_pivots(fb.W)
-        fb.x = fill!(similar(st.u, T, N, cap), zero(T))
-        fb.lanes = fill!(similar(st.u, Int32, cap), Int32(0))
-        fb.cap = cap
+    if K != fb.K
+        if K > fb.cap
+            cap = max(K, 2 * fb.cap, 8)
+            fb.W = fill!(similar(st.u, T, N, N, cap), zero(T))
+            fb.ipiv = lu_pivots(fb.W)
+            fb.lanes = fill!(similar(st.u, Int32, cap), Int32(0))
+            fb.cap = cap
+        end
+        lanes = zeros(Int32, fb.cap)
+        lanes[1:K] .= findall(Array(st.dense_lane))
+        copyto!(fb.lanes, lanes)
+        fb.K = K
     end
-    lanes = zeros(Int32, fb.cap)
-    lanes[1:K] .= findall(mask)
-    copyto!(fb.lanes, lanes)
-    fb.K = K
-    cap = fb.cap
     lane_dense_w_kernel(backend)(
-        fb.W, fb.lanes, st.J, st.sparsity, st.mass_diag, st.dt, st.tab.gamma;
-        ndrange = (N, cap), workgroupsize = (min(N, 64), 1)
+        fb.W, fb.lanes, st.status, st.J, st.sparsity, st.mass_diag, st.dt, st.tab.gamma;
+        ndrange = (N, fb.cap), workgroupsize = (min(N, 64), 1)
     )
     batched_lufact!(backend, fb.W, fb.ipiv)
     lane_dense_check_kernel(backend)(
-        st.status, fb.W, fb.lanes; ndrange = cap, workgroupsize = workgroupsize(backend, cap)
+        st.status, fb.W, fb.lanes; ndrange = fb.cap, workgroupsize = workgroupsize(backend, fb.cap)
     )
     return K
-end
-
-# x = W \ x for the dense lanes gathered by `_lane_dense_factorize!`.
-function _lane_dense_ldiv!(st, x)
-    fb = st.dense_fallback
-    fb.K == 0 && return nothing
-    backend = st.backend
-    N = size(st.u, 1)
-    nk = (N, fb.cap)
-    wg = (min(N, 32), max(1, min(fb.cap, 256 ÷ min(N, 32))))
-    lane_gather_kernel(backend)(fb.x, x, fb.lanes; ndrange = nk, workgroupsize = wg)
-    batched_ldiv!(backend, fb.W, fb.x, fb.ipiv, N, fb.cap)
-    lane_scatter_kernel(backend)(x, fb.x, fb.lanes, st.status; ndrange = nk, workgroupsize = wg)
-    return nothing
 end
 
 # Choose the pivot order from the lanes' current Jacobians `st.J` and step sizes, and

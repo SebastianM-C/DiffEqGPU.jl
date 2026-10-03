@@ -940,7 +940,7 @@ function lane_solve(probs, alg, ensemblealg, u0, p; kwargs...)
         pattern === nothing ? nothing : _lane_values(u0, T, B, N),
         pattern === nothing ? nothing : lv(one(T), T),
         pattern === nothing ? nothing : lv(false, Bool),
-        pattern === nothing ? nothing : LaneDenseFallback(),
+        pattern === nothing ? nothing : LaneDenseFallback(u0, T, N),
         norm_weights, nkeep,
         backend
     )
